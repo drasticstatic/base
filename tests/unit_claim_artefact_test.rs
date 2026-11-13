@@ -296,14 +296,21 @@ fn root_for(tag: &str) -> PathBuf {
 /// vacuous - which already happened once on this tree, an isolated session start emitting zero
 /// bytes against a 3,000-byte budget and being read as a pass.
 fn loud(tag: &str) -> seed::Seed {
+    loud_with(tag, "[bracket]\nenabled = true\n")
+}
+
+/// [`loud`] with the seed's global base.toml given, so a leg can set its own budget key and still overflow.
+fn loud_with(tag: &str, global_toml: &str) -> seed::Seed {
     let root = root_for(tag);
-    let s = seed::write(&root, &seed::REAL, "[bracket]\nenabled = true\n");
+    let s = seed::write(&root, &seed::REAL, global_toml);
     let ws_base = s.ws.join(".base");
     std::fs::create_dir_all(&ws_base).expect("workspace .base");
     let mut toml = String::from("[[domain]]\nname = \"global\"\nmode = \"always\"\nrules = [\n");
-    for i in 0..15 {
+    // 60 rules, about 13 KB: over the 10,000-byte prompt budget measured in BO-02. It was 15 rules (about 3.5 KB) while
+    // the budget was 4,000, and at 10,000 that fixture no longer overflowed, so the controls below refused.
+    for i in 0..60 {
         toml.push_str(&format!(
-            "  \"Global rule {i}: deliberately long enough to overflow a four thousand byte \
+            "  \"Global rule {i}: deliberately long enough to overflow the ten thousand byte \
              budget, because a budget test whose fixture fits inside the budget proves nothing \
              about what happens when it does not.\",\n"
         ));
@@ -635,9 +642,10 @@ fn the_overflow_notice_names_the_key_that_resolved() {
 
     // ARM TWO: the operator legitimately has the legacy key. The notice must name THAT, because
     // that is what is in their file - and the deprecation warning tells them the rest.
-    let root = root_for("resolved-legacy");
     let legacy = RENAMED_BUDGET_KEYS[1].old; // prompt_chars
-    let s = seed::write(&root, &seed::REAL, &format!("[budget]\n{legacy} = 200\n"));
+    // The loud fixture, not a bare seed: this leg overflowed 200 bytes only because every prompt used to carry the
+    // 3.4 KB relay wake contract, which BO-04 made one line.
+    let s = loud_with("resolved-legacy", &format!("[budget]\n{legacy} = 200\n"));
     let (_, out, err) = seed::run_prompt_submit(&s, "a prompt", Some("artefact-resolved-2"));
     let text = format!("{out}\n{err}");
     control("resolved/legacy", "the notice fired", text.contains("withheld"));

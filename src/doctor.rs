@@ -32,6 +32,10 @@ pub struct BackupCompare {
     pub path: String,
     pub backup_line_count: usize,
     pub line_delta: i64,
+    /// Lines base's own repair took out after taking this snapshot, when it recorded them ([`crate::fix::SHRINK_RECORD`]).
+    /// A graph smaller than the snapshot by no more than this is the repair's doing, not a loss (BO-26, lynx's U4 ruling).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_took: Option<usize>,
 }
 
 /// Health report for a single graph tier.
@@ -61,6 +65,14 @@ pub struct TierReport {
     /// lists) on a tier that has never used the feature, and doctor then prints
     /// nothing about it — a store from before 0.14.0 reads exactly as it did.
     pub supersede_audit: crate::supersede::Audit,
+    /// How many of `supersede_audit.corrections_naming_nothing` `base doctor --fix` would link to the one record each
+    /// names, counted by `--fix`'s own link pass ([`crate::fix::corrections_to_link`]). The rest stay corrections
+    /// (D18), so doctor names corrections among what `--fix` repairs only when this is above zero (BO-25).
+    pub corrections_to_link: usize,
+    /// Why that count could not be made, when the link pass failed. Doctor prints it under the count line rather than
+    /// let a failure read as "nothing to link" (code review, BO-25).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corrections_to_link_error: Option<String>,
     /// Named graphs in this tier that belong to ANOTHER workspace, quad count,
     /// highest first (#142). Empty on a clean tier, so a store with nothing
     /// foreign in it serialises and prints exactly as it did before.
@@ -69,6 +81,18 @@ pub struct TierReport {
     /// signal an operator got was `rule list` showing them, while doctor — the
     /// one surface whose job is to say what is wrong — said nothing at all.
     pub foreign_graphs: Vec<(String, usize)>,
+    /// How many of [`Self::foreign_graphs`] `base doctor --fix` would move out. It leaves in place a graph at least as
+    /// large as the tier's own, the shape of this workspace under an earlier folder name ([`crate::fix::left_in_place`]),
+    /// so doctor offers `--fix` for foreign records only when this is above zero (BO-26, U4: an offer `--fix` does not
+    /// keep reads as a command the user must run).
+    pub foreign_to_move: usize,
+    /// The others: each graph `--fix` leaves in place, with why in a person's words (the two sizes that make it this
+    /// workspace's own data under an earlier folder name; `--fix` gives the same reason as
+    /// [`crate::fix::left_in_place_reason`]). Still counted against `healthy`, because a person must say whose records
+    /// they are; doctor prints the reason beside the graph so the verdict is not left unexplained (BO-26, lynx's U4
+    /// ruling; BO-30 for the words).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub foreign_left: Vec<(String, String)>,
     /// Named graphs `base` writes ON PURPOSE that belong to no workspace, so
     /// they are not-own without being a fault. Today exactly one member:
     /// [`crate::apply_ops::LEDGER_GRAPH`], which `apply_ops` documents as living
@@ -88,6 +112,14 @@ pub struct TierReport {
     /// over data it fetched correctly. **Advisory.**
     pub unrecognised_graphs: Vec<(String, usize)>,
     pub latest_backup: Option<BackupCompare>,
+    /// Quads the tier holds, when it parses. Fewer quads than lines means duplicate lines, which is what compaction
+    /// removes: the size advisory names `base graph compact` only then (F24), so it never sends an operator to the
+    /// compaction `base doctor --fix` just ran.
+    pub quad_count: Option<usize>,
+    /// The tier's `{graph}.bak*` snapshots and their bytes, against `[graph] keep_backups` (F24b).
+    pub backups: usize,
+    pub backup_bytes: u64,
+    pub keep_backups: usize,
 }
 
 /// Full doctor report across all resolved tiers.
@@ -99,7 +131,8 @@ pub struct DoctorReport {
     ///
     /// 1. no tier is `"unhealthy"` (i.e. no tier failed to parse),
     /// 2. [`Self::config_errors`] is empty,
-    /// 3. [`Self::trigger_faults`] is empty,
+    /// 3. [`Self::trigger_faults`] is empty: no trigger that cannot fire. A broad trigger is
+    ///    [`Self::trigger_advice`], not a fault (BO-26, Q2 ruling),
     /// 4. no hook is failing **now**, and
     /// 5. no tier carries [`TierReport::foreign_graphs`] (#142).
     ///
@@ -116,11 +149,17 @@ pub struct DoctorReport {
     /// corrupt file otherwise looks exactly like an absent one. Counts against
     /// `healthy`: silently-dead star commands are a fault, not an advisory.
     pub config_errors: Vec<String>,
-    /// Path triggers that cannot fire (F29 step 6): per tier, a domains.toml trigger that
-    /// is unrooted or covers two or more registered projects, with the projects named.
-    /// Counts against `healthy`: an inert trigger is a domain that silently stopped
-    /// loading, and the fix is one line in domains.toml.
+    /// Path triggers that cannot fire (D1, P3): per tier, a domains.toml trigger that is unrooted (a glob, or relative
+    /// with no tier root). Counts against `healthy`: the domain silently lost a trigger, the reason F29 step 6 (PR #67,
+    /// `6427fbc`) made trigger faults a conjunct.
     pub trigger_faults: Vec<String>,
+    /// Path triggers that fire too widely (D1, P3): per tier, a domains.toml trigger that is broad (it holds registered
+    /// projects other than its own project's children), with the projects named; and a project folder that is broad in
+    /// the same way, since the file being touched brings its project's rules (P2). Each line names its narrowing command.
+    /// **Advice, never counted against `healthy`** (lynx's G0 ruling on BO-26's Q2, 2026-10-04): since BO-10 a broad
+    /// trigger fires, so it is not broken, and an upgrade must not turn a working store UNHEALTHY until someone runs a
+    /// command. D1 still rules out base WRITING one: `domain add-trigger` refuses it (P3).
+    pub trigger_advice: Vec<String>,
     /// Which Claude Code version `[budget]` was measured on, against the host running now.
     /// ADVISORY: read by the hook output section only, and it is not one of the five conjuncts.
     pub measured_on: MeasuredOn,
@@ -129,6 +168,14 @@ pub struct DoctorReport {
     /// **Advisory, never counted against `healthy`:** a first screen DUE NOW overflows is a reported state by ruling,
     /// and over budget is a report, not a defect (`auk`'s rank 10 G0 verdict, question 2).
     pub hook_output: Vec<crate::emit::record::TierSizes>,
+    /// Project next steps that are undated (written before 0.16.0) or older than `[doctor] stale_next_days`, one
+    /// line each with the command that rewrites the step (F23b, F23c). **Advisory, never counted against
+    /// `healthy`:** an old plan is worth a look, not a broken store.
+    pub next_steps: Vec<String>,
+    /// The rules and decisions that need attention, from the match log (BO-19, K8, F14c): dead, noisy and ignored
+    /// rules, decisions to review, the correction detector's record. **Advice only, never counted against
+    /// `healthy`:** a user who updates must not see doctor go UNHEALTHY because of usage counts (Chris, 2026-10-03).
+    pub usage: crate::usage::Section,
     /// The write seam this binary was built with, [`store::LOCK_SEAM_MARKER`].
     ///
     /// Not diagnostic information for an operator — it is here so a verification
@@ -191,7 +238,7 @@ enum GraphOrigin {
 /// failure this feature can have — which is why
 /// `tier_own_slug_agrees_with_crud_workspace_slug` pins them together rather than
 /// leaving the equivalence as an assumption inside a larger test.
-fn tier_own_slug(path: &Path) -> String {
+pub(crate) fn tier_own_slug(path: &Path) -> String {
     path.parent()
         .and_then(Path::parent)
         .and_then(Path::file_name)
@@ -205,20 +252,30 @@ fn classify_graph(graph: &str, ns_uri: &str, own_slug: &str) -> GraphOrigin {
     if graph == crate::apply_ops::LEDGER_GRAPH {
         return GraphOrigin::Unscoped;
     }
-    let Some(rest) = graph.strip_prefix(ns_uri).and_then(|r| r.strip_prefix("graph/")) else {
-        return GraphOrigin::Unrecognised;
-    };
-    // `ws/{slug}` and `semantic/{ws}/{doc}` both carry the owning workspace, in
-    // different positions. Any other shape under `graph/` is one this build does
-    // not know: say so rather than inventing an owner for it.
-    let owner = if let Some(slug) = rest.strip_prefix("ws/") {
-        slug
-    } else if let Some(tail) = rest.strip_prefix("semantic/") {
-        tail.split('/').next().unwrap_or("")
+    match graph_owner(graph, ns_uri) {
+        Some(owner) if owner == own_slug => GraphOrigin::Own,
+        Some(_) => GraphOrigin::Foreign,
+        None => GraphOrigin::Unrecognised,
+    }
+}
+
+/// The workspace a named graph belongs to, by its shape: `{ns}graph/ws/{slug}` and `{ns}graph/semantic/{ws}/{doc}`
+/// both carry it, in different positions. `None` for any other shape, which this build does not attribute rather than
+/// inventing an owner for it. [`classify_graph`] and `base doctor --fix`'s move (F15c) read the owner from here, so the
+/// graphs doctor names as foreign are exactly the ones the fix moves.
+pub(crate) fn graph_owner<'a>(graph: &'a str, ns_uri: &str) -> Option<&'a str> {
+    let rest = graph.strip_prefix(ns_uri)?.strip_prefix("graph/")?;
+    if let Some(slug) = rest.strip_prefix("ws/") {
+        Some(slug)
     } else {
-        return GraphOrigin::Unrecognised;
-    };
-    if owner == own_slug { GraphOrigin::Own } else { GraphOrigin::Foreign }
+        rest.strip_prefix("semantic/").map(|tail| tail.split('/').next().unwrap_or(""))
+    }
+}
+
+/// True when `graph` belongs to another workspace than the tier whose own slug is `own_slug`: the one origin that
+/// counts against `healthy` (#142) and the one `base doctor --fix` moves out (F15c).
+pub(crate) fn is_foreign(graph: &str, ns_uri: &str, own_slug: &str) -> bool {
+    classify_graph(graph, ns_uri, own_slug) == GraphOrigin::Foreign
 }
 
 /// Every quad in `store` bucketed by the origin of its graph, each bucket
@@ -294,6 +351,9 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
     // A lingering write_back temp means a write was interrupted. Matches both the
     // legacy shared `graph.nq.tmp` and per-writer `graph.nq.tmp.<pid>` temps.
     let stale_tmp = stale_temp_count(path) > 0;
+    let snapshots = store::backups(path);
+    let (backups, backup_bytes) = (snapshots.len(), snapshots.iter().map(|b| b.bytes).sum::<u64>());
+    let keep_backups = store::keep_backups_for(path);
 
     if status == "missing" {
         return TierReport {
@@ -312,10 +372,18 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
             // A tier with no file holds no quads, so it holds no foreign ones.
             // Empty here is a measurement, not a default standing in for one.
             foreign_graphs: Vec::new(),
+            foreign_to_move: 0,
+            foreign_left: Vec::new(),
             unscoped_graphs: Vec::new(),
             unrecognised_graphs: Vec::new(),
             latest_backup: None,
             supersede_audit: crate::supersede::Audit::default(),
+            corrections_to_link: 0,
+            corrections_to_link_error: None,
+            quad_count: None,
+            backups,
+            backup_bytes,
+            keep_backups,
         };
     }
 
@@ -332,34 +400,50 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
     // Namespace from THIS tier's own base.toml (`<root>/.base/graph.nq` → `<root>`),
     // so a workspace with a custom prefix is read with its own vocabulary rather
     // than the default. Keeps `diagnose_tier` path-scoped — the test-isolation seam.
-    let (schema_version, domain_orphans, supersede_audit, provenance) = if status == "healthy" {
+    let (schema_version, domain_orphans, supersede_audit, provenance, quad_count, to_link) = if status == "healthy" {
         let root = path.parent().and_then(Path::parent).unwrap_or(path);
         let ns = crate::config::BaseConfig::load(root).namespace;
         match store::load_graph(path) {
-            Ok(s) => (
-                crate::migrate::stamp_of_tier(&s, &ns),
-                crate::migrate::orphan_counts(&s, &ns),
-                crate::supersede::audit(&s, &ns),
+            Ok(s) => {
+                let audit = crate::supersede::audit(&s, &ns);
+                let stamp = crate::migrate::stamp_of_tier(&s, &ns);
+                let orphans = crate::migrate::orphan_counts(&s, &ns);
                 // #142. Same already-loaded store, so this costs one more pass
                 // over memory and no I/O at all.
-                graph_provenance(&s, &ns.uri, &tier_own_slug(path)),
-            ),
-            Err(_) => (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default()),
+                let provenance = graph_provenance(&s, &ns.uri, &tier_own_slug(path));
+                let quads = s.len().ok();
+                // BO-25 (D18): last, because it takes the store and changes it in
+                // memory. `--fix`'s own link pass says how many of the corrections
+                // naming nothing it would link. A pass that fails offers no repair
+                // and says why, under the count line.
+                let to_link = if audit.corrections_naming_nothing > 0 {
+                    crate::fix::corrections_to_link(&ns, s, path).map_err(|e| format!("{e:#}"))
+                } else {
+                    Ok(0)
+                };
+                (stamp, orphans, audit, provenance, quads, to_link)
+            }
+            Err(_) => (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default(), None, Ok(0)),
         }
     } else {
         // An unparseable tier is already `unhealthy` for a stated reason with a
         // bad line number. Claiming a provenance verdict from a store that never
         // loaded would put a confident zero where the honest answer is "could not
         // look" — the failure this whole lane exists to remove.
-        (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default())
+        (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default(), None, Ok(0))
+    };
+    let (corrections_to_link, corrections_to_link_error) = match to_link {
+        Ok(n) => (n, None),
+        Err(e) => (0, Some(e)),
     };
 
-    let latest_backup = newest_backup(path).map(|bpath| {
+    let latest_backup = snapshots.first().map(|b| b.path.clone()).map(|bpath| {
         let backup_line_count = count_lines(&bpath);
         BackupCompare {
             path: bpath.display().to_string(),
             backup_line_count,
             line_delta: line_count as i64 - backup_line_count as i64,
+            repair_took: crate::fix::recorded_shrink(path, &bpath),
         }
     });
 
@@ -375,13 +459,42 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
         stale_tmp,
         entity_composition,
         supersede_audit,
+        corrections_to_link,
+        corrections_to_link_error,
         schema_version,
         domain_orphans,
+        foreign_to_move: provenance.foreign.iter().filter(|(_, n)| !crate::fix::left_in_place(*n, provenance.own)).count(),
+        foreign_left: provenance
+            .foreign
+            .iter()
+            .filter(|(_, n)| crate::fix::left_in_place(*n, provenance.own))
+            .map(|(g, n)| (g.clone(), format!("at least as large as this workspace's own data ({n} against {})", provenance.own)))
+            .collect(),
         foreign_graphs: provenance.foreign,
         unscoped_graphs: provenance.unscoped,
         unrecognised_graphs: provenance.unrecognised,
         latest_backup,
+        quad_count,
+        backups,
+        backup_bytes,
+        keep_backups,
     }
+}
+
+/// The rule index's line (BO-18), when `[match] bm25` is on and the folder the prompt hook reads it from holds none it
+/// can use: missing, unreadable, or counted by another tokenizer.
+pub fn score_index_advice(cwd: &Path) -> Option<String> {
+    if !crate::config::BaseConfig::load(cwd).matching.bm25 {
+        return None;
+    }
+    let dir = crate::domain::score_index::index_dir(cwd)?;
+    if crate::domain::score_index::ScoreIndex::load(&dir).is_some() {
+        return None;
+    }
+    Some(format!(
+        "rule index: none usable at {}, so prompts are served by keyword only; the next session start builds it",
+        dir.join(crate::domain::score_index::FILE).display()
+    ))
 }
 
 /// Diagnose both graph tiers (global `~/.base-gbl/.base/graph.nq`, then the
@@ -404,14 +517,23 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         .collect();
     warnings.extend(leaked_global_handoffs());
     warnings.extend(coach_drift());
+    // Read once for the rule count and the usage section (BO-19): a merged store load costs about a second.
+    let config = crate::config::BaseConfig::load(cwd);
+    let domains = crate::domain::load_domains(cwd);
+    let store = store::load_merged(cwd);
     // `auk`'s HARD RULE (2026-09-14): a rule with no matcher of its own is served by its domain's triggers exactly as
     // before, never dropped, and counted here (F11's DETAIL, K4).
-    let unconverted = unconverted_rule_count(cwd);
+    let unconverted = unconverted_rule_count(&config, &domains, store.as_ref());
     if unconverted > 0 {
         warnings.push(format!(
             "rules: {unconverted} rules with no matcher of their own, served by their domain's triggers (base rule list)"
         ));
     }
+    // BO-19: advice from the match log. Not one of the conjuncts below, on purpose. Built here so the merged store is
+    // dropped before the checks below: held to the end of `diagnose` it overlapped them, and doctor's peak memory on
+    // gate 4's fake homes went from 191 MB to 311 MB (198 MB with it dropped here).
+    let usage = crate::usage::section_for(cwd, &config, &domains, store.as_ref());
+    drop(store);
     // #20: a failed hook is invisible everywhere else (fail-open by design); doctor names it.
     // The cwd PARAM, not the process cwd: `diagnose` is called with a path and
     // shadowing it with `std::env::current_dir()` made this section untestable and
@@ -431,6 +553,14 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
     for legacy in crate::config::BaseConfig::legacy_keys(cwd) {
         warnings.push(legacy.sentence());
     }
+    // P3: a trigger still written relative works, and is worth writing out.
+    warnings.extend(relative_trigger_advice(cwd));
+    // BO-28: the upgrade turned the 0.15 installer's developer mode off; for 14 days, and while nobody has set it since,
+    // doctor repeats how to see what base injects without it and how to turn it back on.
+    warnings.extend(crate::upgrade::devmode::advice(cwd));
+    // K7e (BO-18): with no rule index the prompt hook serves keyword-only. A warning naming what builds it, never a
+    // health verdict: a fresh install has none until its first session start (lynx's G0 verdict, Q6).
+    warnings.extend(score_index_advice(cwd));
     // Spec A7: what each hook emitted, from the tier dirs the failure trail reads, each dir once (the workspace and the
     // global dir are one path when cwd is the global tier root).
     let mut dirs_read = std::collections::HashSet::new();
@@ -440,9 +570,11 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         .map(|(tier, dir)| crate::emit::record::read(tier, &dir, crate::emit::record::WINDOW))
         .collect();
     let config_errors = crate::command::check_command_files(cwd);
-    let trigger_faults = trigger_faults(cwd);
+    let (trigger_faults, trigger_advice) = trigger_report(cwd);
     // FIVE conjuncts. Keep the doc comment on `DoctorReport::healthy` in step
     // with this expression — it undercounted for four releases (#142).
+    // `trigger_faults` holds only triggers that cannot fire; broad ones are `trigger_advice`, never counted (BO-26, the
+    // G0 ruling on Q2: an upgrade must not turn a working store UNHEALTHY until someone runs a command).
     let healthy = tiers.iter().all(|t| t.status != "unhealthy")
         && config_errors.is_empty()
         && trigger_faults.is_empty()
@@ -478,27 +610,77 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         warnings,
         config_errors,
         trigger_faults,
+        trigger_advice,
         // One subprocess per `diagnose`, not one per render: both call sites below read this.
-        measured_on: check_measured_on(&crate::config::BaseConfig::load(cwd).budget.measured_on),
+        measured_on: check_measured_on(&config.budget),
         hook_output,
+        next_steps: stale_next_steps(cwd),
+        usage,
         seam: store::LOCK_SEAM_MARKER,
+    }
+}
+
+/// Every project next step that is undated, or older than `[doctor] stale_next_days` (F23b, F23c), as the line
+/// doctor prints, with the command that rewrites it. Every project in the workspace file, once each; done work
+/// (`complete`, `completed`, `archived`) is left alone. Read-only.
+pub fn stale_next_steps(cwd: &Path) -> Vec<String> {
+    let config = crate::config::BaseConfig::load(cwd);
+    let Ok((records, _)) =
+        crate::crud::project::list_data(cwd, &config, &crate::scope::ProjectScope::All)
+    else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in records {
+        let Some(next) = &r.next_action else { continue };
+        if crate::protocol::reconcile::TERMINAL_STATUSES.contains(&r.status.as_str()) || !seen.insert(r.id.clone()) {
+            continue;
+        }
+        let what = match r.next_action_age_days {
+            None => "next step undated, probably stale".to_string(),
+            Some(d) if d > config.doctor.stale_next_days => format!("next step {d} days old"),
+            Some(_) => continue,
+        };
+        // A PAUL project's step is its phase line, rewritten from `.paul` at every session start: the fix is there,
+        // and `--next-action` would be replaced.
+        let fix = match r.path.as_deref().and_then(crate::crud::project_paths::paul_file) {
+            Some(file) => format!("update: the phase in {file} (base rewrites this step from it)"),
+            None => format!("update: base project update {} --next-action \"...\"", r.id),
+        };
+        out.push(format!(
+            "project {id}: {what}: \"{step}\" · {fix}",
+            id = r.id,
+            step = crate::crud::project::excerpt(next, 30),
+        ));
+    }
+    out
+}
+
+fn push_next_steps(out: &mut String, next_steps: &[String]) {
+    if !next_steps.is_empty() {
+        out.push_str("\n─── project next steps ───────────────\n");
+        for n in next_steps {
+            out.push_str(&format!("   ⚠ {n}\n"));
+        }
     }
 }
 
 /// Live rules, in every domain that injects, that carry no matcher of their own (F11's DETAIL: "`base doctor` lists
 /// rules with no matcher of their own"). Read-only: no domain sync, so doctor never writes the graph.
-fn unconverted_rule_count(cwd: &Path) -> usize {
-    let config = crate::config::BaseConfig::load(cwd);
-    let domains = crate::domain::load_domains(cwd);
-    let store = store::load_merged(cwd);
+fn unconverted_rule_count(
+    config: &crate::config::BaseConfig,
+    domains: &[crate::domain::DomainDef],
+    store: Option<&oxigraph::store::Store>,
+) -> usize {
     let converted: std::collections::HashSet<String> =
-        crate::domain::rules::rules_with_matchers(store.as_ref(), &config, &domains)
+        crate::domain::rules::rules_with_matchers(store, config, domains)
             .into_iter()
             .map(|c| c.rule.id)
             .collect();
     let mut unconverted: std::collections::HashSet<String> = std::collections::HashSet::new();
     for domain_def in domains.iter().filter(|d| d.auto_inject) {
-        for rule in crate::domain::rules::rules_for_domain(store.as_ref(), &config, domain_def) {
+        for rule in crate::domain::rules::rules_for_domain(store, config, domain_def) {
             if !converted.contains(&rule.id) {
                 unconverted.insert(rule.id);
             }
@@ -507,27 +689,80 @@ fn unconverted_rule_count(cwd: &Path) -> usize {
     unconverted.len()
 }
 
-/// Every inert path trigger, per tier, as the sentence `add-trigger` refuses with
-/// (F29 step 6). Each tier is read from its own domains.toml and resolved against its
-/// own root, against the registered projects of the merged store.
-fn trigger_faults(cwd: &Path) -> Vec<String> {
+/// Every path trigger with a fault, per tier (D1, P3), in the sentence [`crate::domain::matcher::fault_sentence`]
+/// builds, as `(faults, advice)`. Each tier is read from its own domains.toml and resolved against its own root, against
+/// the registered projects of the merged store.
+///
+/// An unrooted trigger cannot fire: a fault, counted against `healthy`. A broad trigger fires (BO-10) and is advice
+/// (lynx's G0 ruling on BO-26's Q2): the same sentence, naming the projects it holds and `base domain paths --suggest`,
+/// only its place moves.
+///
+/// Then every broad project folder whose project has a domain, as advice too: the file being touched brings its
+/// project's rules (P2), so a project folder is that domain's trigger too, written or not. Named once, and only when no
+/// trigger of the domain already names the same place, since that line covers it.
+fn trigger_report(cwd: &Path) -> (Vec<String>, Vec<String>) {
+    use crate::domain::matcher;
     let ctx = crate::domain::trigger_context(cwd);
-    let mut tiers: Vec<(&str, PathBuf, Option<PathBuf>)> = Vec::new();
-    if let Some(home) = crate::home::home_root() {
-        tiers.push(("global", home.join(".base-gbl").join("domains.toml"), Some(home)));
-    }
-    if let Some(base_dir) = crate::config::find_workspace_base(cwd) {
-        let root = base_dir.parent().map(Path::to_path_buf);
-        tiers.push(("workspace", base_dir.join("domains.toml"), root));
-    }
+    let mut faults = Vec::new();
     let mut out = Vec::new();
-    for (tier, path, root) in tiers {
+    for (tier, path, root) in crate::domain::paths::tier_files(cwd) {
         let domains = crate::domain::load_domains_file(&path, root.as_deref());
-        for (domain, trigger, fault) in crate::domain::matcher::inert_triggers(&domains, &ctx) {
-            out.push(format!("{tier} tier: {}", crate::domain::matcher::fault_sentence(domain, trigger, &fault)));
+        for (domain, trigger, fault) in matcher::faulty_triggers(&domains, &ctx) {
+            let line = format!("{} tier: {}", tier.label(), matcher::fault_sentence(domain, trigger, &fault));
+            match fault {
+                matcher::TriggerFault::Unrooted => faults.push(line),
+                matcher::TriggerFault::Broad(_) => out.push(line),
+            }
         }
     }
-    out
+    let domains = crate::domain::load_domains(cwd);
+    let mut named: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for r in ctx.registered.iter().filter(|r| !r.path.is_empty()) {
+        let Some(d) = domains.iter().find(|d| d.auto_inject && !d.is_always() && crate::crud::slugify(&d.name) == r.slug) else {
+            continue;
+        };
+        let written = d
+            .paths
+            .iter()
+            .any(|t| matcher::live_trigger(t, d.root.as_deref(), &ctx).is_some_and(|t| matcher::path_under(&t, &r.path) && matcher::path_under(&r.path, &t)));
+        let broad = matcher::trigger_breadth(&r.path, &d.name, &ctx);
+        if written || broad.is_empty() || !named.insert(r.slug.as_str()) {
+            continue;
+        }
+        let folder = crate::crud::project::absolute_path(&r.path, None, None).unwrap_or_else(|| r.path.clone());
+        out.push(format!(
+            "project `{}`'s folder `{folder}` holds {}: the rules of `{}` reach every file in it no other project holds (base project paths --suggest proposes its folder)",
+            r.slug,
+            matcher::count_projects(&broad),
+            d.name
+        ));
+    }
+    (faults, out)
+}
+
+/// One advisory line for the path triggers still written relative (P3: base stores a trigger as its full path).
+/// They resolve against their tier root and fire as before, so this is advice, not a fault. A pattern is left to the
+/// fault list, which names it as unrooted.
+fn relative_trigger_advice(cwd: &Path) -> Option<String> {
+    let mut relative: Vec<String> = Vec::new();
+    for (tier, path, root) in crate::domain::paths::tier_files(cwd) {
+        for d in crate::domain::load_domains_file(&path, root.as_deref()) {
+            for t in d.paths.iter().filter(|t| !crate::domain::matcher::is_absolute(t) && !t.trim().starts_with('~') && !t.contains(['*', '?'])) {
+                relative.push(format!("`{t}` on `{}` ({})", d.name, tier.label()));
+            }
+        }
+    }
+    if relative.is_empty() {
+        return None;
+    }
+    let shown: Vec<&str> = relative.iter().take(3).map(String::as_str).collect();
+    let more = relative.len().saturating_sub(shown.len());
+    let tail = if more > 0 { format!(" and {more} more") } else { String::new() };
+    Some(format!(
+        "{} path trigger(s) are written relative ({}{tail}); base stores a trigger as its full path: base domain paths --suggest writes them out",
+        relative.len(),
+        shown.join(", ")
+    ))
 }
 
 /// Render a clearly-delimited human report.
@@ -550,9 +785,10 @@ pub fn format_human(report: &DoctorReport) -> String {
         // Same reasoning for advisories: a coach lagging the binary is true
         // whether or not a graph exists here, and this early return used to
         // swallow it entirely.
-        for w in &report.warnings {
+        for w in report.trigger_advice.iter().chain(&report.warnings) {
             out.push_str(&format!("   ⚠ {w}\n"));
         }
+        push_next_steps(&mut out, &report.next_steps);
         push_hook_output(&mut out, &report.hook_output, &report.measured_on);
         return out;
     }
@@ -604,6 +840,17 @@ pub fn format_human(report: &DoctorReport) -> String {
             ));
             for (g, n) in &t.foreign_graphs {
                 out.push_str(&format!("       {n} · {g}\n"));
+            }
+            // BO-30: what it most likely is, why base thinks so, and what the person can do. A workspace's graph is named
+            // for its folder, so the graph's last part is that earlier folder name. No command re-homes it, so none is
+            // named.
+            for (g, why) in &t.foreign_left {
+                let folder = g.rsplit('/').next().unwrap_or(g);
+                out.push_str(&format!(
+                    "       base found data saved under what looks like this workspace's earlier folder name, `{folder}` \
+                     ({g}). It is {why}, so it is probably yours from before the folder was renamed. base will not \
+                     move it by itself, because only you can say whose it is.\n"
+                ));
             }
             // The one bounded extra line auk ruled in scope. Fires ONLY for the
             // shape where every quad in the tier sits in a single non-own graph,
@@ -665,6 +912,11 @@ pub fn format_human(report: &DoctorReport) -> String {
                         "   {} correction(s) name nothing they correct\n",
                         a.corrections_naming_nothing
                     ));
+                    if let Some(e) = &t.corrections_to_link_error {
+                        out.push_str(&format!(
+                            "   ⚠ could not work out which of them `base doctor --fix` would link: {e}\n"
+                        ));
+                    }
                 }
                 if a.status_without_edge > 0 || a.edge_without_status > 0 {
                     // Two numbers, not one: status-without-edge is a pre-0.14.0
@@ -711,7 +963,22 @@ pub fn format_human(report: &DoctorReport) -> String {
         }
 
         if let Some(b) = &t.latest_backup {
-            if b.line_delta < 0 {
+            let shrink = b.line_delta.unsigned_abs() as usize;
+            if b.line_delta < 0
+                && let Some(took) = b.repair_took
+                && shrink <= took
+            {
+                // The repair's own doing, by no more than it recorded: not a loss (BO-26, lynx's U4 ruling). Anything
+                // beyond it, or a snapshot with no record, keeps the warning below.
+                // In a person's words (BO-30). "Nothing was lost" holds: the backup is the graph from before that
+                // repair, so it holds every line the repair took out.
+                out.push_str(&format!(
+                    "   backup: {} lines, made just before base cleaned up your base data. The cleanup took {took} lines \
+                     out (other workspaces' entries moved out, repeated lines dropped), so your data is {shrink} lines \
+                     smaller, and nothing was lost [{}]\n",
+                    b.backup_line_count, b.path,
+                ));
+            } else if b.line_delta < 0 {
                 out.push_str(&format!(
                     "   ⚠ {} lines smaller than newest backup ({} lines) — possible data loss [{}]\n",
                     -b.line_delta, b.backup_line_count, b.path,
@@ -723,9 +990,19 @@ pub fn format_human(report: &DoctorReport) -> String {
                 ));
             }
         }
+        if t.status != "missing" {
+            out.push_str(&format!(
+                "   keeps {} backup(s) ({} MB) · [graph] keep_backups = {}\n",
+                t.backups,
+                t.backup_bytes / (1024 * 1024),
+                t.keep_backups
+            ));
+        }
     }
 
     push_hook_output(&mut out, &report.hook_output, &report.measured_on);
+    // BO-19: after the hook output section, as the build order places it. Advice only.
+    out.push_str(&crate::usage::render(&report.usage));
 
     if !report.config_errors.is_empty() {
         out.push_str("\n─── config faults ────────────────────\n");
@@ -741,11 +1018,22 @@ pub fn format_human(report: &DoctorReport) -> String {
         }
     }
 
-    if !report.warnings.is_empty() {
+    push_next_steps(&mut out, &report.next_steps);
+
+    // A broad trigger is advice (BO-26, Q2 ruling): the fault's sentence, among the advisories, never in the verdict.
+    if !report.warnings.is_empty() || !report.trigger_advice.is_empty() {
         out.push_str("\n─── advisories ───────────────────────\n");
-        for w in &report.warnings {
+        for w in report.trigger_advice.iter().chain(&report.warnings) {
             out.push_str(&format!("   ⚠ {w}\n"));
         }
+    }
+
+    let fixable = fixable(report);
+    if !fixable.is_empty() {
+        out.push_str(&format!(
+            "\n`base doctor --fix` plans the repair of: {} (`--fix --yes` applies it)\n",
+            fixable.join(", ")
+        ));
     }
 
     let verdict = if report.healthy {
@@ -754,6 +1042,35 @@ pub fn format_human(report: &DoctorReport) -> String {
         "Verdict: UNHEALTHY ⚠ — repair before relying on recall / learn / sync"
     };
     out.push_str(&format!("\n{verdict}\n"));
+    out
+}
+
+/// What in this report `base doctor --fix` repairs (BO-12), named in the order it repairs them. Doctor used to end
+/// UNHEALTHY and offer no repair at all.
+fn fixable(report: &DoctorReport) -> Vec<&'static str> {
+    let any = |f: &dyn Fn(&TierReport) -> bool| report.tiers.iter().any(f);
+    let mut out = Vec::new();
+    if any(&|t| t.foreign_to_move > 0) {
+        out.push("records of another workspace");
+    }
+    // Only the corrections `--fix` would link: the rest stay corrections, so naming them here would promise a repair
+    // `--fix` does not make (BO-25, D18). The count line above still reports them all.
+    if any(&|t| t.corrections_to_link > 0) {
+        out.push("corrections to link to what they correct");
+    }
+    if any(&|t| t.supersede_audit.status_without_edge + t.supersede_audit.edge_without_status > 0) {
+        out.push("the supersession disagreement");
+    }
+    if any(&|t| t.quad_count.is_some_and(|q| t.line_count > q)) {
+        out.push("duplicate lines (compaction)");
+    }
+    if any(&|t| t.backups > t.keep_backups) {
+        out.push("backups past [graph] keep_backups");
+    }
+    // `LegacyKey::sentence` is the only writer of this advisory.
+    if report.warnings.iter().any(|w| w.starts_with("legacy: [signal] max_chars ")) {
+        out.push("legacy [signal] max_chars");
+    }
     out
 }
 
@@ -780,13 +1097,16 @@ pub enum MeasuredOn {
     Differs { measured: String, host: String },
     /// The check could not run. THIS IS NOT "THEY AGREE" and it never prints as reassurance.
     Unknown { configured: String, why: String },
+    /// Hook budgets set by hand with no `measured_on` beside them: never measured on any host, whatever the default
+    /// `measured_on` says (BO-02 review). Every install before BO-02 has `session_start_bytes = 9000` this way.
+    Unmeasured { keys: Vec<String> },
 }
 
 /// The first `N.N.N` in a string, so each side may carry whatever label it likes: `claude --version`
 /// prints `2.1.278 (Claude Code)` while `measured_on` holds `claude-code 2.1.278`. Comparing the raw
 /// strings would report a difference on every machine forever — a check that cannot pass is not a
 /// check, and it would have been indistinguishable from real drift.
-fn version_in(s: &str) -> Option<String> {
+pub(crate) fn version_in(s: &str) -> Option<String> {
     let c: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < c.len() {
@@ -859,24 +1179,38 @@ fn host_version() -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Read `[budget] measured_on` against the live host. Runs a subprocess, so `diagnose` calls it once.
-pub fn check_measured_on(configured: &str) -> MeasuredOn {
-    compare_measured_on(configured, host_version().as_deref())
+/// Read `[budget] measured_on` against the live host. Runs a subprocess, so `diagnose` calls it once. Hook budgets
+/// set by hand with no `measured_on` beside them were never measured on any host, so they are reported as that
+/// before any version is compared.
+pub fn check_measured_on(budget: &crate::config::BudgetConfig) -> MeasuredOn {
+    if !budget.unmeasured_keys.is_empty() {
+        return MeasuredOn::Unmeasured { keys: budget.unmeasured_keys.clone() };
+    }
+    compare_measured_on(&budget.measured_on, host_version().as_deref())
 }
 
-/// The one line that frames every budget number under it.
+/// The running Claude Code's version, bare (`2.1.287`), or `None` when `claude --version` did not answer with one.
+/// `base doctor --measure` records it as `[budget] measured_on`.
+pub fn host_claude_version() -> Option<String> {
+    host_version().as_deref().and_then(version_in)
+}
+
+/// The one line that frames every budget number under it. `measured_on` is the shipped default until
+/// `base doctor --measure` writes the user's own, so the line names the key rather than "the defaults" (F6d).
 fn push_measured_on(out: &mut String, m: &MeasuredOn) {
     match m {
         MeasuredOn::Matches { version } => out.push_str(&format!(
-            "   budget defaults were measured on claude-code {version}, which is what this host runs.\n"
+            "   [budget] measured_on is {version}, which is what this host runs.\n"
         )),
         MeasuredOn::Differs { measured, host } => out.push_str(&format!(
-            "   ⚠ budget defaults were measured on claude-code {measured}; this host runs {host}. \
-             The numbers below were measured against a host that has since moved — re-measure them, \
-             then set [budget] measured_on to what you measured on.\n"
+            "   ⚠ [budget] measured_on is {measured}; this host runs {host} · run base doctor --measure\n"
         )),
         MeasuredOn::Unknown { configured, why } => out.push_str(&format!(
-            "   budget defaults say \"{configured}\" — NOT CHECKED against this host: {why}\n"
+            "   [budget] measured_on is \"{configured}\" — NOT CHECKED against this host: {why}\n"
+        )),
+        MeasuredOn::Unmeasured { keys } => out.push_str(&format!(
+            "   ⚠ [budget] {} set in base.toml with no measured_on beside it · run base doctor --measure\n",
+            keys.join(", ")
         )),
     }
 }
@@ -972,6 +1306,34 @@ fn push_hook_output(
                     t.tier, e.hook, e.last.first_screen_u16, e.first_screen_overflow_runs, e.runs
                 ));
             }
+            // Where to read what the prompt hook's cut withheld, named only when the file is there: the workspace's
+            // latest of any session, then, inside a session, its own (BO-06, F11).
+            let full = Path::new(&t.dir).join(crate::emit::record::PROMPT_FULL_FILE);
+            if e.hook == "user-prompt-submit" && full.is_file() {
+                out.push_str(&format!(
+                    "   {} tier · {}: full text of the last prompt's output, any session: {}\n",
+                    t.tier,
+                    e.hook,
+                    full.display()
+                ));
+            }
+            let own = match e.hook.as_str() {
+                "session-start" => Some(("start", crate::emit::session_files::SESSION_START_FILE)),
+                "user-prompt-submit" => Some(("last prompt's output", crate::emit::session_files::PROMPT_FILE)),
+                _ => None,
+            };
+            if let Some((what, name)) = own
+                && let Some(dir) = crate::relay::env_session_id()
+                    .and_then(|sid| crate::emit::session_files::session_dir(Path::new(&t.dir), &sid))
+                && dir.join(name).is_file()
+            {
+                out.push_str(&format!(
+                    "   {} tier · {}: full text of this session's {what}: {}\n",
+                    t.tier,
+                    e.hook,
+                    dir.join(name).display()
+                ));
+            }
         }
     }
 }
@@ -985,7 +1347,20 @@ fn trim_clause(run: &crate::emit::record::Run) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let mut s = if run.trimmed.is_empty() {
+    // The prompt hook drops whole blocks and names each one (BO-01, F7). A row written before BO-01 has no block names,
+    // only the bytes it cut from the end, and is said that way rather than as "nothing trimmed".
+    let mut s = if !run.dropped.is_empty() {
+        let names: Vec<String> = run
+            .dropped
+            .iter()
+            .map(|(block, items, bytes)| {
+                format!("{block} ({items} items, {} bytes)", crate::emit::prompt::thousands(*bytes))
+            })
+            .collect();
+        format!(" · withheld: {}", names.join(", "))
+    } else if run.withheld_bytes > 0 {
+        format!(" · withheld {} bytes from the end", run.withheld_bytes)
+    } else if run.trimmed.is_empty() {
         " · nothing trimmed".to_string()
     } else {
         format!(" · trimmed: {}", list(&run.trimmed))
@@ -1073,33 +1448,6 @@ fn term_count(term: &Term) -> Option<usize> {
     }
 }
 
-/// Newest sibling backup file matching `{graph-name}.bak*`, if any.
-fn newest_backup(path: &Path) -> Option<PathBuf> {
-    let parent = path.parent()?;
-    let fname = path.file_name()?.to_str()?;
-    let prefix = format!("{fname}.bak");
-
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in fs::read_dir(parent).ok()?.flatten() {
-        let p = entry.path();
-        let is_bak = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with(&prefix))
-            .unwrap_or(false);
-        if !is_bak {
-            continue;
-        }
-        if let Some(mt) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
-            match &newest {
-                Some((best, _)) if *best >= mt => {}
-                _ => newest = Some((mt, p)),
-            }
-        }
-    }
-    newest.map(|(_, p)| p)
-}
-
 /// Filesystem-safe local timestamp for backup/quarantine filenames.
 fn stamp() -> String {
     chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string()
@@ -1182,33 +1530,6 @@ fn stale_temp_count(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Count + total bytes of `{name}.bak*` sibling backups.
-fn backup_footprint(path: &Path) -> (usize, u64) {
-    let (Some(parent), Some(fname)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
-    else {
-        return (0, 0);
-    };
-    let prefix = format!("{fname}.bak");
-    let mut count = 0usize;
-    let mut bytes = 0u64;
-    if let Ok(rd) = fs::read_dir(parent) {
-        for e in rd.flatten() {
-            if e
-                .file_name()
-                .to_str()
-                .map(|n| n.starts_with(&prefix))
-                .unwrap_or(false)
-            {
-                count += 1;
-                bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
-            }
-        }
-    }
-    (count, bytes)
-}
-
-/// Advisory size/backup bloat warnings for a tier. Never affect `healthy` — a big
-/// graph is a smell (slow writes widen the write-race window), not a failure.
 /// Open handoffs/forks sitting in the GLOBAL tier are almost always leaks from
 /// the pre-#8 fallback, which wrote them there whenever a session ran outside a
 /// workspace — and a global handoff then resurfaces at the start of every
@@ -1247,36 +1568,44 @@ fn leaked_handoffs_in(gbl: &Path) -> Vec<String> {
     }
     vec![format!(
         "{} open handoff/fork(s) in the GLOBAL tier — these resurface in every project. \
-         Likely leaks from writes made outside a workspace. Review with `base handoff list` \
-         and stop each with `base handoff archive <slug>`: {}",
+         Likely leaks from writes made outside a workspace, or, before 0.16.0, from a folder inside \
+         ~/.base-gbl. Review with `base handoff list` and stop each with `base handoff archive <slug>` \
+         (`base handoff unarchive <slug>` undoes it): {}",
         slugs.len(),
         slugs.join(", ")
     )]
 }
 
+/// Advisory size/backup bloat warnings for a tier. Never affect `healthy` — a big
+/// graph is a smell (slow writes widen the write-race window), not a failure.
+///
+/// Each one names the repair that changes it, and only when that repair would (F24): compaction removes duplicate lines
+/// and nothing else, so a big graph whose every line is a distinct quad is not sent to `base graph compact` (it was,
+/// right after `base doctor --fix` had compacted it); and backups past `[graph] keep_backups` are what `--fix` removes.
+/// The old fixed limits (5 backups, 50 MB of them) fired on three backups of any graph over 17 MB.
 fn bloat_warnings(tier: &TierReport) -> Vec<String> {
     const BLOAT_GRAPH_BYTES: u64 = 20 * 1024 * 1024;
-    const BLOAT_BACKUP_COUNT: usize = 5;
-    const BLOAT_BACKUP_BYTES: u64 = 50 * 1024 * 1024;
     let mut w = Vec::new();
     if tier.status == "missing" {
         return w;
     }
-    if tier.size_bytes > BLOAT_GRAPH_BYTES {
+    let duplicates = tier.quad_count.map(|q| tier.line_count.saturating_sub(q)).unwrap_or(0);
+    if tier.size_bytes > BLOAT_GRAPH_BYTES && duplicates > 0 {
         w.push(format!(
-            "{} graph is {} MB / {} lines — consider `base graph compact`",
+            "{} graph is {} MB / {} lines, {duplicates} of them duplicates — consider `base graph compact`",
             tier.tier,
             tier.size_bytes / (1024 * 1024),
             tier.line_count
         ));
     }
-    let (count, bytes) = backup_footprint(Path::new(&tier.path));
-    if count > BLOAT_BACKUP_COUNT || bytes > BLOAT_BACKUP_BYTES {
+    if tier.backups > tier.keep_backups {
         w.push(format!(
-            "{} tier keeps {} backups ({} MB) — prune old .bak files",
+            "{} tier keeps {} backups ({} MB), more than [graph] keep_backups = {} — `base doctor --fix` removes the oldest {}",
             tier.tier,
-            count,
-            bytes / (1024 * 1024)
+            tier.backups,
+            tier.backup_bytes / (1024 * 1024),
+            tier.keep_backups,
+            tier.backups - tier.keep_backups
         ));
     }
     w
@@ -1451,59 +1780,115 @@ pub fn format_repair_human(outcomes: &[RepairOutcome]) -> String {
 // ─── Restore (Phase 35) ────────────────────────────────────────────────────
 
 /// Backup snapshots for a tier: sibling `{fname}.bak*` files with line counts,
-/// newest first.
+/// newest first, in the order [`store::backups`] keeps and rotates them.
 pub fn list_backups(path: &Path) -> Vec<(PathBuf, usize)> {
-    let (parent, prefix) = match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
-        (Some(p), Some(f)) => (p, format!("{f}.bak")),
-        _ => return Vec::new(),
+    store::backups(path)
+        .into_iter()
+        .map(|b| {
+            let n = count_lines(&b.path);
+            (b.path, n)
+        })
+        .collect()
+}
+
+/// What `base doctor --restore <path>` may put back (BO-26, lynx's G0 ruling on Q4): only a backup base made, so the one
+/// undo verb the upgrade prints can never overwrite an arbitrary file.
+#[derive(Debug, PartialEq)]
+pub enum Restorable {
+    /// A graph snapshot (`graph.nq.bak*`) in a tier's `.base`: it restores that tier's `graph.nq`.
+    Graph { graph: PathBuf },
+    /// A config file's backup (`<name>.toml.BAK-<date>-pre-<version>`, what the upgrade writes) beside the file in a tier:
+    /// it restores that file.
+    Config { file: PathBuf },
+}
+
+/// Whether `backup` is a backup base made, and what it restores; else why it is refused. The tier folders are the
+/// global tier's `~/.base-gbl` and its `.base`, and the workspace's `.base` found from `cwd`.
+pub fn restorable(cwd: &Path, backup: &Path) -> std::result::Result<Restorable, String> {
+    let refused = || {
+        format!(
+            "{} is not a backup base made, so nothing was changed. --restore takes a graph snapshot (graph.nq.bak-*) in a \
+             tier's .base, or a <name>.toml.BAK-<date>-pre-<version> beside a base config file in a tier",
+            backup.display()
+        )
     };
-    let mut baks: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    let Ok(rd) = fs::read_dir(parent) else {
-        return Vec::new();
+    let key = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (Some(given), Some(name)) = (backup.parent(), backup.file_name().and_then(|n| n.to_str())) else {
+        return Err(refused());
     };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        let is_bak = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with(&prefix))
-            .unwrap_or(false);
-        if !is_bak {
-            continue;
-        }
-        if let Some(mt) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
-            baks.push((mt, p));
-        }
+    // Compared as canonical paths, returned as given: a canonical Windows path prints with a `\\?\` prefix.
+    let dir = key(given);
+    let gbl = crate::home::home_root().map(|h| h.join(".base-gbl"));
+    let stores: Vec<PathBuf> = gbl
+        .iter()
+        .map(|g| g.join(".base"))
+        .chain(crate::config::find_workspace_base(cwd))
+        .map(|p| key(&p))
+        .collect();
+    let configs: Vec<PathBuf> =
+        gbl.iter().cloned().chain(crate::config::find_workspace_base(cwd)).map(|p| key(&p)).collect();
+    let what = if name.starts_with("graph.nq.bak") && stores.contains(&dir) {
+        Restorable::Graph { graph: given.join("graph.nq") }
+    } else if let Some((file, rest)) = name.split_once(".BAK-")
+        && ["base.toml", "commands.toml", "domains.toml"].contains(&file)
+        && rest.len() > "YYYYMMDD-HHMMSS-pre-".len()
+        && rest.as_bytes()[..8].iter().all(u8::is_ascii_digit)
+        && rest.contains("-pre-")
+        && configs.contains(&dir)
+    {
+        Restorable::Config { file: given.join(file) }
+    } else {
+        return Err(refused());
+    };
+    if !backup.is_file() {
+        return Err(format!("backup not found: {}", backup.display()));
     }
-    baks.sort_by_key(|b| std::cmp::Reverse(b.0)); // newest first
-    baks.into_iter().map(|(_, p)| {
-        let n = count_lines(&p);
-        (p, n)
-    }).collect()
+    Ok(what)
+}
+
+/// Put a config file's backup back over `file`, the file as it is now copied aside first (`<name>.BAK-<date>-pre-restore`,
+/// itself restorable). Returns where that copy went. Refuses a file that is a link: base never writes one (BO-26, Q3).
+pub fn restore_config(file: &Path, backup: &Path) -> Result<Option<PathBuf>> {
+    if fs::symlink_metadata(file).is_ok_and(|m| m.file_type().is_symlink()) {
+        anyhow::bail!("{} is a link, and base never writes through a link; put the backup back by hand", file.display());
+    }
+    let aside = if file.exists() { Some(crate::upgrade::backup(file, "restore")?) } else { None };
+    let tmp = file.with_extension("toml.restore-tmp");
+    fs::copy(backup, &tmp).with_context(|| format!("failed to stage restore from {}", backup.display()))?;
+    fs::rename(&tmp, file).with_context(|| format!("failed to swap {} into place", file.display()))?;
+    Ok(aside)
 }
 
 /// Restore `path` from `backup`. Snapshots the CURRENT file first (so a wrong
 /// restore is itself recoverable), then swaps the backup into place via the same
 /// temp→rename discipline as `write_back` (never hand-writes the live file).
+///
+/// The backup is staged BEFORE that snapshot: the snapshot rotates out the oldest
+/// past `[graph] keep_backups`, and the backup being restored can be that one
+/// (BO-26 code review: the upgrade prints this restore as its undo, and its
+/// snapshot is the oldest after two later ones).
 pub fn restore_tier(path: &Path, backup: &Path) -> Result<()> {
     if !backup.exists() {
         anyhow::bail!("backup not found: {}", backup.display());
     }
-    if path.exists() {
-        store::snapshot(path, "pre-restore")
-            .context("failed to back up current graph before restore")?;
-    }
     let tmp = path.with_extension("nq.tmp");
     fs::copy(backup, &tmp)
         .with_context(|| format!("failed to stage restore from {}", backup.display()))?;
+    if path.exists()
+        && let Err(e) = store::snapshot(path, "pre-restore")
+    {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.context("failed to back up current graph before restore"));
+    }
     fs::rename(&tmp, path)
         .with_context(|| format!("failed to swap {} into place", path.display()))?;
     Ok(())
 }
 
 /// Resolve the (tier, graph.nq path) pairs the same way [`diagnose`] walks them:
-/// global first, then the nearest workspace, deduped by canonical path.
-fn tier_paths(cwd: &Path) -> Vec<(String, PathBuf)> {
+/// global first, then the nearest workspace, deduped by canonical path. `base doctor --fix`
+/// repairs exactly these, so it never touches a tier doctor did not report.
+pub(crate) fn tier_paths(cwd: &Path) -> Vec<(String, PathBuf)> {
     let mut tiers = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -1787,7 +2172,10 @@ mod tests {
             warnings: Vec::new(),
             config_errors: Vec::new(),
             trigger_faults: Vec::new(),
+            trigger_advice: Vec::new(),
             hook_output: Vec::new(),
+            next_steps: Vec::new(),
+            usage: Default::default(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human = format_human(&report);
@@ -1806,7 +2194,10 @@ mod tests {
             warnings: Vec::new(),
             config_errors: Vec::new(),
             trigger_faults: Vec::new(),
+            trigger_advice: Vec::new(),
             hook_output: Vec::new(),
+            next_steps: Vec::new(),
+            usage: Default::default(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human2 = format_human(&report2);
@@ -2010,7 +2401,10 @@ mod coach_drift_tests {
             warnings: vec![skill_drift_warning(Some("0.12.3"), "0.13.2", true).unwrap()],
             config_errors: vec![],
             trigger_faults: vec![],
+            trigger_advice: vec![],
             hook_output: vec![],
+            next_steps: Vec::new(),
+            usage: Default::default(),
             seam: store::LOCK_SEAM_MARKER,
         };
         assert!(report.healthy, "an advisory must not flip the verdict");
@@ -2099,6 +2493,39 @@ mod measured_on_tests {
         }
     }
 
+    /// F6d, the brief's Example 4: Claude Code moved on after the budgets were measured, and doctor says so in one line
+    /// that names both versions and the command that re-measures. The value `base doctor --measure` writes is the bare
+    /// version (`2.1.286`), so that is the configured side here.
+    #[test]
+    fn doctor_flags_version_mismatch() {
+        let m = compare_measured_on("2.1.286", Some("2.1.290 (Claude Code)"));
+        let mut out = String::new();
+        push_measured_on(&mut out, &m);
+        assert_eq!(out, "   ⚠ [budget] measured_on is 2.1.286; this host runs 2.1.290 · run base doctor --measure\n");
+        // After a measure run on the host it names, the line agrees and points nowhere.
+        let mut out = String::new();
+        push_measured_on(&mut out, &compare_measured_on("2.1.290", Some("2.1.290 (Claude Code)")));
+        assert_eq!(out, "   [budget] measured_on is 2.1.290, which is what this host runs.\n");
+    }
+
+    /// BO-02 review: budgets pinned by hand with no `measured_on` beside them were never measured, so the default
+    /// `measured_on` must not vouch for them. No subprocess runs: the check answers before it asks the host.
+    #[test]
+    fn hand_set_budgets_with_no_measured_on_ask_for_a_measure() {
+        let budget = crate::config::BudgetConfig {
+            unmeasured_keys: vec!["session_start_bytes".to_string()],
+            ..Default::default()
+        };
+        let m = check_measured_on(&budget);
+        assert_eq!(m, MeasuredOn::Unmeasured { keys: vec!["session_start_bytes".to_string()] });
+        let mut out = String::new();
+        push_measured_on(&mut out, &m);
+        assert_eq!(
+            out,
+            "   ⚠ [budget] session_start_bytes set in base.toml with no measured_on beside it · run base doctor --measure\n"
+        );
+    }
+
     /// The match line is quiet: no warning mark, so a reader skimming for problems does not find one.
     #[test]
     fn the_match_line_carries_no_warning() {
@@ -2133,6 +2560,7 @@ mod hook_output_tests {
                 budget: Size::bytes(budget),
                 full: Size::bytes(emitted * 3),
                 first_screen_u16: 2000,
+                first_screen_len_u16: None,
                 over_budget: over,
                 first_screen_ok: screen_ok,
                 trimmed: trimmed
@@ -2141,6 +2569,8 @@ mod hook_output_tests {
                     .collect(),
                 other_withheld: Vec::new(),
                 unrecognised: Vec::new(),
+                dropped: Vec::new(),
+                withheld_bytes: 0,
             }
         }
         let session = EventSizes {
@@ -2168,6 +2598,7 @@ mod hook_output_tests {
             warnings: vec![],
             config_errors: vec![],
             trigger_faults: vec![],
+            trigger_advice: vec![],
             hook_output: vec![
                 TierSizes {
                     tier: "workspace".to_string(),
@@ -2185,6 +2616,8 @@ mod hook_output_tests {
                     events: vec![],
                 },
             ],
+            next_steps: Vec::new(),
+            usage: Default::default(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human = format_human(&report);
@@ -2208,5 +2641,69 @@ mod hook_output_tests {
             !human.contains("workspace tier · session-start: no run on record"),
             "a tier with runs on record is not absent:\n{human}"
         );
+    }
+
+    /// Example 5 (BO-01, F7): a prompt run names every block its budget dropped, with items and bytes, where it used
+    /// to say only how many bytes it cut from the end. A row written before BO-01 still reads the old way.
+    #[test]
+    fn doctor_names_the_blocks_a_prompt_run_withheld() {
+        use crate::emit::record::{EventSizes, FileState, Run, Size, TierSizes};
+        let run = |ts: &str, emitted: usize, dropped: Vec<(String, usize, usize)>, withheld_bytes: usize| Run {
+            ts: ts.to_string(),
+            emitted: Size::bytes(emitted),
+            budget: Size::bytes(4000),
+            full: Size::bytes(5081),
+            first_screen_u16: 0,
+            first_screen_len_u16: None,
+            over_budget: withheld_bytes > 0,
+            first_screen_ok: true,
+            trimmed: Vec::new(),
+            other_withheld: Vec::new(),
+            unrecognised: Vec::new(),
+            dropped,
+            withheld_bytes,
+        };
+        let after = run(
+            "t3",
+            3990,
+            vec![("global-context".to_string(), 5, 1150), ("bracket-rules".to_string(), 7, 2400)],
+            3550,
+        );
+        let before = run("t1", 3970, Vec::new(), 1336);
+        let prompt = EventSizes {
+            hook: "user-prompt-submit".to_string(),
+            runs: 2,
+            last: after,
+            largest: before,
+            over_budget_runs: 2,
+            latest_over_budget: Some("t3".to_string()),
+            first_screen_overflow_runs: 0,
+            latest_first_screen_overflow: None,
+        };
+        let report = DoctorReport {
+            measured_on: MeasuredOn::Matches { version: "2.1.278".to_string() },
+            tiers: vec![],
+            healthy: true,
+            warnings: vec![],
+            config_errors: vec![],
+            trigger_faults: vec![],
+            trigger_advice: vec![],
+            hook_output: vec![TierSizes {
+                tier: "workspace".to_string(),
+                dir: "/ws/.base".to_string(),
+                file: FileState::Present { unreadable_lines: 0, unreadable_files: 0 },
+                events: vec![prompt],
+            }],
+            next_steps: Vec::new(),
+            usage: Default::default(),
+            seam: store::LOCK_SEAM_MARKER,
+        };
+        let human = format_human(&report);
+        for want in [
+            "   workspace tier · user-prompt-submit: last run 3990 of 4000 bytes at t3 · withheld: global-context (5 items, 1,150 bytes), bracket-rules (7 items, 2,400 bytes)\n",
+            "   workspace tier · user-prompt-submit: largest of the last 2 run(s) on record: 3970 of 4000 bytes at t1 · withheld 1336 bytes from the end\n",
+        ] {
+            assert!(human.contains(want), "missing {want:?} in:\n{human}");
+        }
     }
 }

@@ -85,7 +85,7 @@ pub fn handle(
         out.push(
             "hooks-wired",
             &format!(
-                "[hooks] wired base hook {} into ~/.claude/settings.json (new in this release; live from the next session).\n",
+                "[hooks] wired base hook {} into ~/.claude/settings.json (new in this build; live from the next session; the file before it is kept beside it as settings.json.bak-base-*).\n",
                 added.join(", ")
             ),
             1,
@@ -130,6 +130,15 @@ pub fn handle(
         _ => {}
     }
 
+    // BO-15, C3 for every user (Round 2): when no CLAUDE.md this session loads asks the AI to mark a corrected reply,
+    // session start carries the line instead, once per session. Chris's T2 asks for UPDATED:, so his sessions never
+    // carry it (D10). And the correction detector's cursor files past `[log] prompt_days` go.
+    if let Some(line) = crate::corrections::claude_md::session_start_line(config, cwd) {
+        out.push("corrections", &format!("{line}\n"), 1);
+    }
+    crate::corrections::prune_state(config.log.prompt_days);
+    crate::corrections::tune::prune_marks(config.log.prompt_days);
+
     // Every app gets a code map the first time a session opens in it — a
     // marked repo, or a bare folder of source files nobody has `git init`ed
     // yet — and a refresh when it has one (Chris, 2026-09-01: "anytime a dev
@@ -160,6 +169,7 @@ pub fn handle(
     // with the real folder last-touch, then decay cold projects active→deferred (and
     // revive the reverse) BEFORE signals surface, so the rendered state is already
     // true. Fail-open; gated on [protocol] enabled.
+    push_auto_archived(config, cwd, out);
     reconcile_active_state(config, cwd);
 
     // Emit operator profile (if configured)
@@ -188,7 +198,17 @@ pub fn handle(
     // It now runs ONCE, here, for both paths. Queries render BESIDE the signals,
     // which is what `docs/settings-hook-config.md` has always promised. Where the
     // block lands in the output is decided by `LAYOUT`, not by when it is pushed.
-    let queries_shown = render_adhoc_queries(cwd, config, out);
+    // One parse of the graph for both readers here: the ad-hoc queries and the global decisions. Each used to
+    // be the only reader, and a second parse of a multi-megabyte store costs a second or more per session start.
+    let graph = load_session_graph(cwd, config);
+    let queries_shown = render_adhoc_queries(graph.as_ref(), cwd, config, out);
+    push_global_decisions(graph.as_ref(), cwd, config, out);
+    push_rule_proposals(graph.as_ref(), config, out);
+    push_rule_pass(session_id, config, out);
+    refresh_score_index(graph.as_ref(), cwd, config);
+    push_matcher(config, cwd, out);
+    push_devmode_off(config, cwd, out);
+    push_upgrade(cwd, out);
 
     if let Ok(signal_result) = crate::signal::run_signals(cwd, config, "session-start") {
         diagnostics.extend(signal_result.diagnostics.iter().cloned());
@@ -273,18 +293,10 @@ pub fn handle(
 /// This is QTF-1's fix, ruled option 2. Called ONCE, before the signal early-return,
 /// so ad-hoc queries render BESIDE the signals instead of only when every signal is
 /// silent -- which, on any workspace with real data, was never.
-fn render_adhoc_queries(cwd: &Path, config: &BaseConfig, out: &mut SessionOutput) -> usize {
-    let trig_files = discover_trig_files(cwd);
-    if trig_files.is_empty() {
-        return 0;
-    }
-    let paths: Vec<&Path> = trig_files.iter().map(|p| p.as_path()).collect();
-    let Ok(graph) = store::load_graphs(&paths) else {
+fn render_adhoc_queries(graph: Option<&oxigraph::store::Store>, cwd: &Path, config: &BaseConfig, out: &mut SessionOutput) -> usize {
+    let Some(graph) = graph else {
         return 0;
     };
-    if ontology::load_vocabulary(&graph, &config.namespace).is_err() {
-        return 0;
-    }
 
     let queries = load_queries(cwd, config);
     let mut output = String::new();
@@ -300,7 +312,7 @@ fn render_adhoc_queries(cwd: &Path, config: &BaseConfig, out: &mut SessionOutput
             u = config.namespace.uri,
             body = qdef.sparql,
         );
-        if let Ok(results) = store::query(&graph, &sparql) {
+        if let Ok(results) = store::query(graph, &sparql) {
             let section = format_results(results, &qdef.format, &qdef.description);
             if !section.is_empty() {
                 output.push_str(&section);
@@ -315,17 +327,137 @@ fn render_adhoc_queries(cwd: &Path, config: &BaseConfig, out: &mut SessionOutput
     shown
 }
 
+/// Both tiers' graphs with the vocabulary, for the session-start readers that query the graph directly. `None`
+/// when there is no graph or it will not load: FAIL-OPEN, as [`render_adhoc_queries`] explains, and the
+/// unhealthy-graph warning has already been collected by the time this runs.
+fn load_session_graph(cwd: &Path, config: &BaseConfig) -> Option<oxigraph::store::Store> {
+    let trig_files = discover_trig_files(cwd);
+    if trig_files.is_empty() {
+        return None;
+    }
+    let paths: Vec<&Path> = trig_files.iter().map(|p| p.as_path()).collect();
+    let graph = store::load_graphs(&paths).ok()?;
+    ontology::load_vocabulary(&graph, &config.namespace).ok()?;
+    Some(graph)
+}
+
+/// K7e (BO-18): count the rule index the prompt hook ranks by, from the graph session start already loaded, into the
+/// folder the prompt hook reads it from. Unchanged scoring texts write nothing. Silent: a failure is one line on stderr
+/// and the prompt hook serves keyword-only until a later sync builds it; `base doctor` names a missing index.
+fn refresh_score_index(graph: Option<&oxigraph::store::Store>, cwd: &Path, config: &BaseConfig) {
+    if !config.matching.bm25 {
+        return;
+    }
+    let Some(dir) = crate::domain::score_index::index_dir(cwd) else { return };
+    let domains = crate::domain::load_domains(cwd);
+    // Session start's own load is strict and gives nothing on one bad line; the index is then counted from the lenient
+    // load the commands use (`store::load_merged`), never from no graph at all, or it would lose every graph rule and
+    // decision until the next command rebuilt it.
+    let lenient = graph.is_none().then(|| crate::store::load_merged(cwd)).flatten();
+    if let Err(why) = crate::domain::score_index::refresh(graph.or(lenient.as_ref()), config, &domains, &dir) {
+        eprintln!("base: could not build the rule index in {}: {why}", dir.display());
+    }
+}
+
+/// K9f, K9g, K9h (BO-20): while a shadow runs, after the index refresh, promote a candidate whose evidence is clear,
+/// roll back a promotion whose corrections rose past the noise, and say each once. With no shadow ever started this is
+/// one failed file open and prints nothing (the seamless upgrade). The indexes a running shadow needs are counted
+/// first: a BM25 candidate beside a keyword-only live, the prompt-IDF counts, a proposals candidate's own index.
+fn push_matcher(config: &BaseConfig, cwd: &Path, out: &mut SessionOutput) {
+    crate::shadow::run::refresh_indexes(config, cwd);
+    let lines = crate::shadow::promote::session_start(config, cwd);
+    if !lines.is_empty() {
+        out.push("matcher", &format!("{}\n", lines.join("\n")), lines.len());
+    }
+}
+
+/// BO-28: the 0.15 installer's developer mode, turned off by this start and said here, once, first on the screen
+/// ([`crate::upgrade::devmode`]). Before [`push_upgrade`], so the line about a tier that could not be changed is among that
+/// block's lines in this same start. Nothing at all unless an upgrade marked a tier due: one small file read per tier.
+fn push_devmode_off(config: &BaseConfig, cwd: &Path, out: &mut SessionOutput) {
+    if !config.graph.auto_migrate {
+        return;
+    }
+    let paragraphs = crate::upgrade::devmode::at_session_start(cwd);
+    if !paragraphs.is_empty() {
+        let text = format!("{}\n{}\n", crate::upgrade::devmode::HEADER, paragraphs.join("\n"));
+        out.push("devmode-off", &text, paragraphs.len());
+    }
+}
+
+/// BO-26 (U5): what an earlier upgrade did, each change with its undo, once. Nothing at all for a home that was never
+/// upgraded: one small file read per tier.
+fn push_upgrade(cwd: &Path, out: &mut SessionOutput) {
+    let lines = crate::upgrade::announcements(cwd);
+    if !lines.is_empty() {
+        out.push("upgrade", &format!("{}\n", lines.join("\n")), lines.len());
+    }
+}
+
+/// The global decisions with no keywords (BO-03, F5): a decision of an always-on domain reaches a prompt only
+/// on one of its keywords, so one with none is shown here, at session start, and nowhere else.
+fn push_global_decisions(graph: Option<&oxigraph::store::Store>, cwd: &Path, config: &BaseConfig, out: &mut SessionOutput) {
+    let Some(graph) = graph else {
+        return;
+    };
+    let domains = crate::domain::load_domains(cwd);
+    let global = crate::domain::global_decisions::GlobalDecisions::load(graph, config, &domains);
+    let (text, items) = global.session_start_block();
+    if items > 0 {
+        out.push("global-decisions", &text, items);
+    }
+}
+
+/// K5b (BO-16, D8): the rule proposals waiting for review, left from earlier sessions (BO-15 writes them), counted in
+/// the graph already loaded. One line, and nothing when none is pending.
+fn push_rule_proposals(graph: Option<&oxigraph::store::Store>, config: &BaseConfig, out: &mut SessionOutput) {
+    let Some(graph) = graph else {
+        return;
+    };
+    let pending = crate::corrections::review::pending_count(graph, &config.namespace);
+    if pending > 0 {
+        out.push("rule-proposals", &format!("{}\n", crate::corrections::review::session_start_line(pending)), pending);
+    }
+}
+
+/// D7e (BO-17): earlier sessions that ended, or sat untouched for a day, with corrections no rule pass has read. One
+/// line, and nothing when there are none. It only counts: the pass is the AI's to run (`base tune`), never a hook's.
+/// `[corrections] enabled = false` turns it off with the counts it reads (G0 question 12).
+fn push_rule_pass(session_id: Option<&str>, config: &BaseConfig, out: &mut SessionOutput) {
+    if !config.corrections.enabled {
+        return;
+    }
+    let n = crate::corrections::tune::catch_up(session_id);
+    if n > 0 {
+        out.push(crate::corrections::tune::CATCH_UP_BLOCK, &format!("{}\n", crate::corrections::tune::catch_up_line(n)), n);
+    }
+}
+
 /// Spec B1: every block's rank, and inside its rank its place. The trimmer takes the bottom of the
 /// lowest rank first, so the `Tail` order is B1 row 8's list read upward: diagnostics shrink first,
 /// pulse last, and the relay wake contract outlasts the operator profile and the notices. A kind
 /// missing from this table sorts after all of it, and `every_pushed_kind_has_a_place_in_the_layout`
 /// fails the build when one does.
-pub const LAYOUT: [(&str, Rank); 31] = [
+pub const LAYOUT: [(&str, Rank); 40] = [
+    // BO-28: the upgrade turned the 0.15 installer's developer mode off at this start. First, above the instructions,
+    // and `Pinned`, so no budget pass shortens it and it is always inside the first screen. Printed at one start only.
+    ("devmode-off", Rank::Pinned),
     ("instructions", Rank::Pinned),
     ("graph-unhealthy", Rank::DueNow),
     ("reminders", Rank::DueNow),
     ("relay-inbox", Rank::DueNow),
     ("handoffs", Rank::Primary),
+    // BO-16, K5b: the rule proposals left from earlier sessions, one line, AFTER the handoffs so it never pushes
+    // DUE NOW or HANDOFFS down, and at Primary so it is never inside the first screen's measure (header, Pinned, DueNow).
+    ("rule-proposals", Rank::Primary),
+    // BO-17, D7e: earlier sessions with corrections no rule pass has read, one line, beside the proposals it leads to.
+    ("rule-pass", Rank::Primary),
+    // BO-20, K9h: a shadow candidate promoted, rolled back or ready, one line each, once, beside the rule lines.
+    ("matcher", Rank::Primary),
+    // BO-26, U5: what an upgrade did, one line per change with its undo, once, beside the matcher's line.
+    ("upgrade", Rank::Primary),
+    // BO-27, V4: a reminder the auto-archive pass archived, one line each with its undo, once, in the upgrade's shape.
+    ("reminder-archived", Rank::Primary),
     ("forks", Rank::Secondary),
     // BEFORE the working-set blocks it qualifies, deliberately. The trimmer takes the
     // bottom of a rank first, so a scope clause placed after the rows would be trimmed
@@ -339,13 +471,20 @@ pub const LAYOUT: [(&str, Rank); 31] = [
     ("pulse", Rank::Tail),
     ("flow-resurface", Rank::Tail),
     ("memory", Rank::Tail),
+    // BO-03, F5: the global decisions with no keywords, which no prompt receives.
+    ("global-decisions", Rank::Tail),
     ("triggers", Rank::Tail),
     ("relay-tasks", Rank::Tail),
     ("relay-wake", Rank::Tail),
+    // The unregistered session's invitation to join a relay store. Until BO-00 B4 it rode
+    // `relay-inbox` at DueNow and took 165 units of the first screen on Chris's store.
+    ("relay-notice", Rank::Tail),
     ("operator", Rank::Tail),
     ("extensions", Rank::Tail),
     ("queries", Rank::Tail),
     ("flow-protocol", Rank::Tail),
+    // BO-15: the CORRECTED line for a CLAUDE.md that asks for no correction marker, beside the other behaviour rules.
+    ("corrections", Rank::Tail),
     ("auto-compact", Rank::Tail),
     ("migrate", Rank::Tail),
     ("hooks-wired", Rank::Tail),
@@ -380,8 +519,14 @@ const DATA_BLOCKS: [&str; 6] = ["reminders", "handoffs", "forks", "projects", "t
 /// their own trigger (migrate, hooks-wired, contract, automap) are not here: a failing map build
 /// or a duplicate contract repeats every session, and with no command their floor already names
 /// the file.
-pub const SHOWN_ONCE: [&str; 5] = [
+pub const SHOWN_ONCE: [&str; 8] = [
     "first-run",
+    // BO-28: the paragraph leaves the tier's record as the change is made.
+    "devmode-off",
+    // BO-20: an announcement leaves the shadow state as it is produced.
+    "matcher",
+    // BO-26: an upgrade's lines leave its record as they are produced.
+    "upgrade",
     "update-applied",
     "relay-inbox",
     "relay-tasks",
@@ -395,7 +540,12 @@ pub fn command_for(kind: &str) -> Option<&'static str> {
         "graph-unhealthy" | "hooks-health" => Some("base doctor"),
         "operator" => Some("base operator show"),
         "handoffs" => Some("base handoff list"),
+        "rule-proposals" => Some("base rule review"),
+        "rule-pass" => Some("base tune"),
         "reminders" => Some("base reminder list"),
+        // BO-27: what the auto-archive pass archived stays listed there, each with the slug its undo takes, so a floor
+        // that names it loses nothing even when the full output was not written.
+        "reminder-archived" => Some("base reminder list --archived"),
         "forks" => Some("base fork list"),
         "projects" => Some("base project list --all"),
         "tasks" => Some("base task list"),
@@ -423,13 +573,6 @@ pub fn floor_line(kind: &str, items: usize, full: &FullOutput) -> String {
     }
 }
 
-/// Where the untrimmed session start goes (spec A6): the workspace `.base` when one resolves,
-/// else the global tier's `.base` when it exists. Never created here, so a session opened
-/// outside every tier gets no file and its floors say so. The letters file sits beside it.
-fn full_output_path(cwd: &Path) -> Option<PathBuf> {
-    crate::crud::handoff_show::session_start_dir(cwd).map(|dir| dir.join("last-session-start.md"))
-}
-
 fn kind_of(id: &str) -> &str {
     id.split('#').next().unwrap_or(id)
 }
@@ -444,11 +587,19 @@ fn kind_of(id: &str) -> &str {
 pub struct SessionOutput {
     fragments: Fragments,
     signals: Option<SignalOutput>,
+    /// The session this start belongs to, when the host named one: DUE NOW's numbers are kept per
+    /// session so `base reminder archive <number>` cannot reach another session's list.
+    session_id: Option<String>,
 }
 
 impl SessionOutput {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Name the session this start belongs to.
+    pub fn set_session(&mut self, session_id: Option<&str>) {
+        self.session_id = session_id.map(str::to_string);
     }
 
     /// One print site's exact output, newlines included. `items` counts what it lists.
@@ -496,6 +647,7 @@ impl SessionOutput {
                 text: part.text,
                 total: part.items,
                 shown: part.items,
+                fits: Vec::new(),
             })
             .collect();
         let letters = self
@@ -503,7 +655,8 @@ impl SessionOutput {
             .as_ref()
             .map(|s| s.letters.clone())
             .unwrap_or_default();
-        let deferred = self.signals.as_ref().map(|s| s.deferred).unwrap_or(0);
+        // Every number the header prints, counted once with the blocks (BO-06, F10).
+        let counts = self.signals.as_ref().map(|s| s.counts.clone()).unwrap_or_default();
         if let Some(signals) = &self.signals {
             for signal in signals.signals() {
                 for block in &signal.blocks {
@@ -513,6 +666,8 @@ impl SessionOutput {
                         text: block.text.clone(),
                         total: block.total,
                         shown: block.items,
+                        // DUE NOW's shorter renderings, for the first-screen pass in `Emission::render`.
+                        fits: block.fits.clone(),
                     });
                 }
             }
@@ -524,9 +679,10 @@ impl SessionOutput {
             placed.push(Placed {
                 id: "instructions".to_string(),
                 kind: "instructions".to_string(),
-                text: instruction_block(&letters, deferred),
+                text: instruction_block(&letters, placed.iter().any(|p| p.kind == "devmode-off")),
                 total: 0,
                 shown: 0,
+                fits: Vec::new(),
             });
         }
         // Stable: blocks of one place keep the order they arrived in.
@@ -534,12 +690,19 @@ impl SessionOutput {
         for (i, p) in placed.iter_mut().enumerate() {
             // The sites' own leading and trailing newlines belonged to the old print order. In
             // B1's order every block is one paragraph, a blank line before each but the first.
-            let body = p.text.trim_matches('\n');
-            p.text = if i == 0 {
-                body.to_string()
-            } else {
-                format!("\n{body}")
+            // A block's fits are the same paragraph listing less, so they are spaced the same way.
+            let paragraph = |text: &str| {
+                let body = text.trim_matches('\n');
+                if i == 0 {
+                    body.to_string()
+                } else {
+                    format!("\n{body}")
+                }
             };
+            p.text = paragraph(&p.text);
+            for fit in &mut p.fits {
+                fit.0 = paragraph(&fit.0);
+            }
         }
 
         let mut untrimmed = Emission::new(budget.session_start_bytes, budget.first_screen_chars);
@@ -549,10 +712,26 @@ impl SessionOutput {
             let pushed = untrimmed.push(block);
             debug_assert!(pushed, "block ids are unique by construction");
         }
+        // The untrimmed text (spec A6) and the letters go where session start keeps its files: the workspace `.base`
+        // when one resolves, else the global tier's when it exists. Never created here, so a session opened outside
+        // every tier gets no file and its floors say so. Each session writes its own files and the workspace's latest
+        // copies (BO-06, F11); the header names the session's own. Folders of sessions gone `[log] prompt_days` are
+        // removed first (F11e).
+        let dir = crate::crud::handoff_show::session_start_dir(cwd);
+        if let Some(dir) = dir.as_deref() {
+            emit::session_files::prune(dir, config.log.prompt_days);
+        }
+        let session = self.session_id.as_deref();
         let full = if !budget.write_full_output {
             FullOutput::off()
-        } else if let Some(path) = full_output_path(cwd) {
-            let written = emit::write_full_output(&path, &untrimmed.full_text());
+        } else if let Some(dir) = dir.as_deref() {
+            let written = emit::session_files::write(
+                dir,
+                session,
+                emit::session_files::SESSION_START_FILE,
+                emit::session_files::LATEST_SESSION_START,
+                &untrimmed.full_text(),
+            );
             if let Some(why) = written.failure() {
                 eprintln!("base: session start could not write its full output: {why}");
             }
@@ -561,15 +740,34 @@ impl SessionOutput {
             FullOutput::not_written("no workspace .base and no global .base directory to hold it")
         };
         if self.signals.is_some()
-            && let Some(dir) = crate::crud::handoff_show::session_start_dir(cwd)
+            && let Some(dir) = dir.as_deref()
         {
-            let kept = crate::crud::handoff_show::write_letters(&dir, &letters);
+            let reminders = self
+                .signals
+                .as_ref()
+                .map(|s| s.reminders.as_slice())
+                .unwrap_or_default();
+            let kept = crate::crud::handoff_show::write_letters(dir, session, &letters, reminders);
             if let Some(why) = kept.failure() {
-                eprintln!("base: session start could not keep its handoff letters: {why}");
+                eprintln!("base: session start could not keep its handoff letters and DUE NOW numbers: {why}");
             }
         }
 
         let mut emission = Emission::new(budget.session_start_bytes, budget.first_screen_chars);
+        // BO-28 (lynx's ruling): the one start that prints the developer-mode paragraph may run the first screen past
+        // `first_screen_chars` by what the paragraph adds: its own lines, the blank line after it, and step 1's
+        // exception in the instructions. The paragraph is first and is what that start must show; DUE NOW is not cut to
+        // make room for it, the run counts as fitting, and its record names the block. Any other overflow is reported.
+        if let Some(p) = placed.iter().find(|p| p.kind == "devmode-off") {
+            let own = emit::u16_len(p.text.trim_matches(['\r', '\n'])) + 2;
+            let step = if placed.iter().any(|p| p.kind == "instructions") {
+                emit::u16_len(&instruction_block(&letters, true))
+                    .saturating_sub(emit::u16_len(&instruction_block(&letters, false)))
+            } else {
+                0
+            };
+            emission.excuse_from_first_screen("devmode-off", own + step);
+        }
         for p in placed {
             let floor = floor_line(&p.kind, p.total, &full);
             let command = command_for(&p.kind)
@@ -577,19 +775,20 @@ impl SessionOutput {
                 .unwrap_or("")
                 .to_string();
             let block = Block::new(p.id, place(&p.kind).0, p.text, floor, command)
-                .items(p.total, p.shown);
+                .items(p.total, p.shown)
+                .with_fits(p.fits);
             let pushed = emission.push(block);
             debug_assert!(pushed, "block ids are unique by construction");
         }
         for row in withheld {
             emission.note_withheld(row.block, row.items, row.reason, row.command);
         }
-        let header = |facts: &Facts<'_>| header_line(facts, deferred);
+        let header = |facts: &Facts<'_>| header_line(facts, &counts);
         let rendered = emission.render(&full, Some(&header));
         if !rendered.first_screen_ok {
             eprintln!(
-                "base: session start's header, instructions and DUE NOW take more than the first {} units",
-                rendered.first_screen_u16
+                "base: session start's header, instructions and DUE NOW take {} units, more than the first {}",
+                rendered.first_screen_len_u16, rendered.first_screen_u16
             );
         }
         if rendered.over_budget {
@@ -599,6 +798,30 @@ impl SessionOutput {
             );
         }
 
+        // BO-27, V4: a reminder's archive warning counts as seen only once a session start has printed it. DUE NOW lists
+        // the first `items_shown` of its reminders (the first-screen pass may step it down), in `reminders` order, so
+        // exactly those lines printed. Recorded here, between the render and the print.
+        if let Some(signals) = &self.signals {
+            let printed = rendered
+                .blocks
+                .iter()
+                .find(|b| kind_of(b.id()) == "reminders")
+                .map(|b| b.items_shown())
+                .unwrap_or(0);
+            let first: Vec<String> = signals
+                .reminders
+                .iter()
+                .zip(&signals.reminders_first_warned)
+                .take(printed)
+                .filter(|(_, first)| **first)
+                .map(|(slug, _)| slug.clone())
+                .collect();
+            if let Err(why) =
+                crate::crud::reminder::mark_warned(crate::home::home_root().as_deref(), cwd, &config.namespace, &first)
+            {
+                eprintln!("base: session start could not record that it showed a reminder's archive warning: {why:#}");
+            }
+        }
         if let Some(signals) = self.signals {
             let in_full: HashSet<&str> = rendered
                 .blocks
@@ -619,23 +842,59 @@ struct Placed {
     text: String,
     total: usize,
     shown: usize,
+    /// Renderings listing fewer items, for the first-screen pass. Only DUE NOW has any.
+    fits: Vec<(String, usize)>,
 }
 
 /// Spec B3, with B7's BEHAVIOR lines merged in: what Claude does first, written before any data
-/// so no trim can remove it. It names only commands that exist. The deferred line (B3) prints when
-/// anything is deferred, so a session with nothing deferred keeps today's block byte for byte.
-pub fn instruction_block(letters: &[(char, String)], deferred: usize) -> String {
-    let mut s = String::from(
-        "DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:\n\
-         1. Show DUE NOW, then HANDOFFS, exactly as lettered. Nothing prepended. No \"is this stale?\" questions.\n\
-         2. The user names a handoff by letter, project or a few words: run `base handoff show <what they said>` and read the doc it prints. Several matches: list them and ask.\n\
-         3. \"snooze <letter> <N>d\" → `base handoff snooze <slug> <N>` · \"archive <letter>\" → `base handoff archive <slug>` · a handled reminder → `base reminder archive <slug>`.\n\
-         4. FORKS are open side-work, not a lettered choice; several stay open. `base fork snooze <title> <N>` · `base fork archive <title>`.\n\
-         5. Every block below is a summary. Its full list is the command on its line, and the whole untrimmed output is the file on line 1. Never guess; run it.",
+/// so no trim can remove it. It names only commands that exist. B3's deferred line (line 6) was
+/// removed by BO-06; see below.
+///
+/// THE WORDING IS BUDGETED. The header, this block (Letters line included) and DUE NOW must end
+/// inside the first 2,000 UTF-16 units; `tests/deferral_test.rs` FS1 holds them to a 1,990 bar on
+/// the worst case (ten 50-character slugs, the two longest DUE NOW lines, and, until BO-06 removed
+/// it, line 6 printing). At
+/// 566c753 that case ended at 2011 units, 21 past the bar and 11 past the screen. Three phrases
+/// were shed (flint, 2026-09-21), each already said elsewhere on the same screen: line 4's
+/// "; several stay open" (line 4 already says forks are not a lettered choice), line 5's "and the
+/// whole untrimmed" → "; the untrimmed", and line 6's "; each block counts them. Bring one back:"
+/// → ". Revive one:" (every block prints its own deferred notice). Measured after: fs1-before
+/// 1831 (was 1861), fs1-after 1953 (was 2011). Every word added here is paid for on that screen,
+/// and FS1 is the receipt.
+///
+/// Line 3 names a reminder by its DUE NOW number since BO-00 B4 (2026-10-01): DUE NOW's lines no
+/// longer print the slug, and `base reminder archive|snooze <number>` read it from the letters file.
+///
+/// SHORTENED AGAIN BY BO-06 (D16b, 2026-10-02), so all five of Chris's due reminders fit the first
+/// screen with the header naming the session's own file (about 45 units longer than the workspace
+/// one). Measured on a copy of his store before: 865 units of instructions, DUE NOW at 3 of 5. Each
+/// phrase removed is said elsewhere on the screen or by a command shown there:
+/// - line 0's ", BEFORE ANYTHING ELSE": line 1's "Nothing prepended".
+/// - line 2's "by letter, project or a few words": `base handoff show`'s own help ("Takes a letter
+///   ..., a slug, a project name, or a few words"), and "<what they said>" passes whatever it is.
+/// - line 2's "Several matches: list them and ask": moved into `show`'s several-match line, the
+///   place it is needed ("None was picked; list them to the user and ask which").
+/// - line 3's quoted phrasings: "Snooze or archive a letter" says the same with the same commands.
+/// - line 4's "open": FORKS's own first line ("FORKS (N open, ...").
+/// - line 5: the same two pointers, reworded shorter.
+/// - line 6 whole: every block with something deferred ends with its notice ("N handoffs are marked
+///   deferred: they are open, but paused. Run base handoff deferred ..."), whose listing prints the
+///   command that brings each one back; and line 2's `base handoff show` revives a deferred match.
+///
+/// After: 617 units of instructions; on the copy of Chris's store, all 5 due reminders print and the
+/// first screen measures under the 1,990 bar (FINAL STATE of BO-06 has the numbers).
+///
+/// `devmode_off`: this start printed the developer-mode paragraph above it (BO-28), which step 1 then lets through.
+pub fn instruction_block(letters: &[(char, String)], devmode_off: bool) -> String {
+    let prepended = if devmode_off { "Nothing prepended except the developer mode paragraph above." } else { "Nothing prepended." };
+    let mut s = format!(
+        "DO THIS FIRST IN YOUR FIRST REPLY:\n\
+         1. Show DUE NOW, then HANDOFFS, exactly as lettered. {prepended} No \"is this stale?\" questions.\n\
+         2. The user names a handoff: run `base handoff show <what they said>` and read the doc it prints.\n\
+         3. Snooze or archive a letter: `base handoff snooze <slug> <N>` · `base handoff archive <slug>`. A handled reminder: `base reminder archive <number>`.\n\
+         4. FORKS are side-work, not lettered: `base fork snooze <title> <N>` · `base fork archive <title>`.\n\
+         5. Each block below is a summary: the command on its line prints all of it; line 1 names the untrimmed file. Never guess; run it.",
     );
-    if deferred > 0 {
-        s.push_str("\n6. Deferred = open but paused, not listed; each block counts them. Bring one back: `base handoff show <words>` (forks: `base fork show`).");
-    }
     if !letters.is_empty() {
         let map: Vec<String> = letters
             .iter()
@@ -648,12 +907,17 @@ pub fn instruction_block(letters: &[(char, String)], deferred: usize) -> String 
 }
 
 /// Spec B2, line 1: every count, the withheld total, and where the untrimmed output is. Rendered
-/// from the blocks at their final level on every trim pass, so it is measured as it is printed. The
-/// deferred total prints only when something is deferred, so a session with nothing deferred keeps
-/// today's line byte for byte.
-pub fn header_line(facts: &Facts<'_>, deferred: usize) -> String {
-    let total = |id: &str| facts.block(id).map(Block::items_total).unwrap_or(0);
+/// on every trim pass, so it is measured as it is printed. The deferred total prints only when
+/// something is deferred, so a session with nothing deferred keeps today's line byte for byte.
+///
+/// THE COUNTS ARE `counts`, NOT THE BLOCKS' (BO-06, F10). Until BO-06 each count was read off the
+/// block printed with it, and a block skipped as unchanged since an earlier session is not printed,
+/// so on 2026-10-01 line 1 said `projects 0 · tasks 0` while the pulse below it said 28 and 145.
+/// Every number here counts what exists, as the pulse and each block's first line do; only
+/// "(N shown)" counts what the handoff list shows at its final level.
+pub fn header_line(facts: &Facts<'_>, counts: &crate::signal::counts::Counts) -> String {
     let handoffs_shown = facts.block("handoffs").map(Block::items_shown).unwrap_or(0);
+    let deferred = counts.deferred();
     let full = match (facts.full.written_path(), facts.full.failure()) {
         (Some(path), _) => path.to_string(),
         (None, Some(why)) => format!("not written ({why})"),
@@ -666,12 +930,12 @@ pub fn header_line(facts: &Facts<'_>, deferred: usize) -> String {
     };
     format!(
         "[BASE START · {} due · handoffs {} open ({handoffs_shown} shown) · forks {} · projects {} · tasks {} · milestones {}{parked} · withheld {} · full: {full}]",
-        total("reminders"),
-        total("handoffs"),
-        total("forks"),
-        total("projects"),
-        total("tasks"),
-        total("milestones"),
+        counts.shown("due", counts.reminders_due),
+        counts.shown("handoffs", counts.handoffs_open),
+        counts.shown("forks", counts.forks_open),
+        counts.shown("projects", counts.projects.active),
+        counts.shown("tasks", counts.tasks.active),
+        counts.shown("milestones", counts.milestones.active),
         facts.withheld_total(),
     )
 }
@@ -843,18 +1107,30 @@ fn check_and_banner(out: &mut SessionOutput) {
     }
 }
 
+/// R3: reminders 10+ days past due archive themselves, in every tier, once their warning has been shown for
+/// [`crate::crud::reminder::WARN_GRACE_DAYS`] (BO-27, V4). Not folded into `protocol::reconcile`: that pass is gated
+/// on `[protocol] enabled` and is workspace-only, and reminders are neither. Before signals render, so DUE NOW is
+/// already true.
+///
+/// Each archive is said once, here, with its undo: this pass is the only thing that archives automatically and it runs
+/// only at session start, so the start that archives is the start that says so. Until BO-27 its result was discarded
+/// (`let _ =`) and reminders left DUE NOW with no line anywhere. Fail-open: an error goes to stderr and the start goes
+/// on.
+fn push_auto_archived(config: &BaseConfig, cwd: &Path, out: &mut SessionOutput) {
+    match crate::crud::reminder::auto_archive_pass(crate::home::home_root().as_deref(), cwd, &config.namespace) {
+        Ok(archived) if !archived.is_empty() => {
+            let lines: Vec<String> = archived.iter().map(|a| a.line()).collect();
+            out.push("reminder-archived", &format!("{}\n", lines.join("\n")), lines.len());
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("base: the reminder auto-archive pass failed, nothing was archived: {e:#}"),
+    }
+}
+
 /// Mechanical active⇄deferred reconcile (task-artifact protocol). Fail-open: any
 /// error leaves graph state as-is and never blocks session start. Silent unless a
 /// status actually flipped (suppression principle — lastActive refreshes are noiseless).
 fn reconcile_active_state(config: &BaseConfig, cwd: &Path) {
-    // R3: reminders 10+ days past due archive themselves, in every tier. Not folded into
-    // `protocol::reconcile` — that pass is gated on `[protocol] enabled` and is workspace-only,
-    // and reminders are neither. Fail-open like the reconcile it sits beside.
-    let _ = crate::crud::reminder::auto_archive_pass(
-        crate::home::home_root().as_deref(),
-        cwd,
-        &config.namespace,
-    );
     // Spec C5: handoffs, forks, tasks and milestones that went cold are deferred, in every tier, before
     // signals render, so session start already shows the truth. Gated on `[defer] enabled`, false in code
     // (lane 3 verdicts, AMENDMENTS B). Fail-open like the passes beside it.
@@ -1228,6 +1504,27 @@ mod tests {
         assert_eq!(level("extensions"), Some(Level::Collapsed), "{}", rendered.text);
     }
 
+    /// BO-06 review: a count whose scan failed is printed `?` on line 1, never as a 0 nobody counted, and the pulse
+    /// leaves its line out. Control: the counts that were counted print as numbers.
+    #[test]
+    fn a_count_whose_scan_failed_prints_a_question_mark() {
+        let mut counts = crate::signal::counts::Counts {
+            reminders_due: 2,
+            forks_open: 4,
+            failed: vec!["projects", "tasks", "milestones"],
+            ..Default::default()
+        };
+        let full = FullOutput::off();
+        let facts = Facts { blocks: &[], withheld: &[], full: &full };
+        let line = header_line(&facts, &counts);
+        assert!(line.contains("· 2 due ·") && line.contains("· forks 4 ·"), "control: {line}");
+        assert!(line.contains("· projects ? · tasks ? · milestones ? ·"), "{line}");
+        counts.decisions_week = 3;
+        let pulse = crate::signal::pulse::render(&counts);
+        assert!(!pulse.contains("Projects:") && !pulse.contains("Tasks:"), "{pulse}");
+        assert!(pulse.contains("Reminders: 2 due") && pulse.contains("Decisions: 3 this week"), "control: {pulse}");
+    }
+
     /// Every block in [`SHOWN_ONCE`] floors to the full-output file and never to a command: its
     /// producer marked it shown, so a command could not print it again. Control: a block that has a
     /// command floors to it, so the assertion can tell the two apart. It holds at commit C's head,
@@ -1254,5 +1551,20 @@ mod tests {
             })
             .collect();
         assert!(checked.len() >= 5, "checked {checked:?}");
+    }
+
+    /// BO-27 code review: the line naming an automatic archive and its undo sits at Primary, so a long session start
+    /// can collapse it to its floor, and with no full output written a floor naming only that file would leave the
+    /// archive unsaid. Its floor names the command that lists every archived reminder with its slug instead, whether or
+    /// not the file was written.
+    #[test]
+    fn an_auto_archive_line_floors_to_the_archived_list() {
+        for full in [FullOutput::off(), FullOutput::not_written("no folder")] {
+            assert_eq!(
+                floor_line("reminder-archived", 2, &full),
+                "reminder-archived 2 · all: base reminder list --archived"
+            );
+        }
+        assert_eq!(place("reminder-archived").0, Rank::Primary, "beside the upgrade's lines");
     }
 }

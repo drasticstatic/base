@@ -1,10 +1,16 @@
+> **drasticstatic's public fork of `base`, pinned to a reviewed revision.** This fork sits at upstream
+> [ChristopherKahler/base](https://github.com/ChristopherKahler/base) `v0.16.0` (`a37b9a8f`), read as text on
+> 2026-11-12 before it was merged. It is not installed anywhere. Why we keep it, the pin, the licence and what to know
+> before anyone runs it: [`DRASTICSTATIC.md`](./DRASTICSTATIC.md). Everything below this note is upstream's README,
+> unchanged.
+
 <p align="center">
   <img src="docs/splash.svg" alt="basemode — the memory your agents were supposed to come with" width="100%">
 </p>
 
 <p align="center">
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-0B63D6?style=flat-square" alt="License: Functional Source License 1.1, Apache 2.0 future license"></a>
-  <img src="https://img.shields.io/badge/version-0.15.2-12263A?style=flat-square" alt="Version 0.15.2">
+  <img src="https://img.shields.io/badge/version-0.16.0-12263A?style=flat-square" alt="Version 0.16.0">
   <img src="https://img.shields.io/badge/rust-single_binary-2F4A63?style=flat-square&logo=rust&logoColor=white" alt="Rust, single binary">
   <img src="https://img.shields.io/badge/built_for-Claude_Code-C2551F?style=flat-square" alt="Built for Claude Code">
 </p>

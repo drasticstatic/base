@@ -374,6 +374,16 @@ fn run(
         .env_remove("BASE_NO_WAKE_NUDGE")
         .env_remove("BASE_NO_AUTONAME")
         .env_remove("BASE_RELAY_AS")
+        // Set inside base's own headless calls, where every hook returns at once (BO-08, F27).
+        .env_remove("BASE_HEADLESS")
+        // A Windows Terminal tab id makes a session with no title reclaim whichever title was registered from the
+        // same tab (BO-05 tests auto-title new sessions), so a run inside a terminal would differ from one in CI.
+        .env_remove("WT_SESSION")
+        // Claude Code puts the session id in every Bash tool's environment, so a test run from a
+        // session would otherwise hand that session to each command it spawns.
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        // And `CLAUDECODE=1`, which makes `base rule add` require keywords and a test prompt (BO-15).
+        .env_remove("CLAUDECODE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -432,9 +442,163 @@ pub fn run_session_start(seed: &Seed, session: Option<&str>) -> (i32, String, St
     )
 }
 
+/// Any hook `event`, driven as Claude Code drives it: `payload` on stdin, from the workspace. `env` is set on the hook
+/// process on top of the scrubbed environment, so a test says which kind of run it is (BO-08: `BASE_HEADLESS`, and the
+/// relay title and terminal tab a headless call inherits from the session that started it).
+pub fn run_hook(seed: &Seed, event: &str, payload: &serde_json::Value, env: &[(&str, &str)]) -> (i32, String, String) {
+    hook_at(seed, &seed.ws, event, &payload.to_string(), env)
+}
+
+/// [`run_hook`] standing in `cwd` instead of the seeded workspace: a session that moved into another folder (BO-15).
+pub fn run_hook_at(
+    seed: &Seed,
+    cwd: &Path,
+    event: &str,
+    payload: &serde_json::Value,
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
+    hook_at(seed, cwd, event, &payload.to_string(), env)
+}
+
+/// One `base hook <event>` process standing in `cwd`, `payload` on stdin, on the scrubbed environment plus `env`: the
+/// one place the hook runners that take extra variables build the process, so the scrub list is written once.
+fn hook_at(seed: &Seed, cwd: &Path, event: &str, payload: &str, env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = Command::new(BIN);
+    cmd.args(["hook", event])
+        .current_dir(cwd)
+        .env("BASE_HOME", &seed.home)
+        .env("BASE_NO_AUTO_UPDATE", "1")
+        .env("BASE_AST_NO_SPAWN", "1")
+        .env_remove("BASE_NO_WAKE_NUDGE")
+        .env_remove("BASE_NO_AUTONAME")
+        .env_remove("BASE_RELAY_AS")
+        // Set inside base's own headless calls, where every hook returns at once (BO-08, F27).
+        .env_remove("BASE_HEADLESS")
+        .env_remove("WT_SESSION")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CLAUDECODE")
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("the base binary runs");
+    child.stdin.take().expect("stdin").write_all(payload.as_bytes()).expect("stdin written");
+    let out = child.wait_with_output().expect("base finishes");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The pre-tool-use hook, driven as Claude Code drives it: JSON on stdin naming the tool and its input. `env` is set on
+/// the hook process on top of the scrubbed environment (`BASE_NO_WAKE_NUDGE`, `BASE_RELAY_AS`), so a test says which
+/// kind of run it is; with none, it is an interactive session's tool call.
+pub fn run_pre_tool_use(
+    seed: &Seed,
+    tool: &str,
+    input: serde_json::Value,
+    session: &str,
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
+    run_pre_tool_use_at(seed, &seed.ws, tool, input, session, env)
+}
+
+/// [`run_pre_tool_use`] with the session standing in `cwd` (the payload's cwd and the process's), as a session that
+/// has `cd`ed into an app does.
+pub fn run_pre_tool_use_at(
+    seed: &Seed,
+    cwd: &Path,
+    tool: &str,
+    input: serde_json::Value,
+    session: &str,
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
+    let payload = serde_json::json!({
+        "cwd": cwd.display().to_string(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool,
+        "tool_input": input,
+        "session_id": session,
+    })
+    .to_string();
+    hook_at(seed, cwd, "pre-tool-use", &payload, env)
+}
+
+/// Folders the pre-tool hints are measured against (BO-07), all under the seed's home so the automatic-map rules treat
+/// them as a real machine's apps rather than temp folders.
+pub struct Apps {
+    /// An app with a code map (a stub `ast.ttl`; the hint reads only that it exists): `src/lib.rs`, `src/hook/mod.rs`,
+    /// `api/routes/users.ts`, and `docs/guide.md` (a folder holding no source).
+    pub mapped: PathBuf,
+    /// An app with no code map: `src/main.rs`.
+    pub plain: PathBuf,
+    /// An app under `<home>/.cache`, where base never maps on its own: `src/main.rs`.
+    pub cached: PathBuf,
+    /// A source file in no app: `<home>/loose/x.rs`.
+    pub loose: PathBuf,
+}
+
+/// Write [`Apps`] under `seed.home`, plus the docs and config the corpus searches: `<home>/.base-gbl/handoffs/one.md`,
+/// `<home>/.base-gbl/extra.toml`, `<home>/notes/plan.md`.
+pub fn write_apps(seed: &Seed) -> Apps {
+    let dev = seed.home.join("dev");
+    let mapped = dev.join("mapped-app");
+    let plain = dev.join("plain-app");
+    let cached = seed.home.join(".cache").join("cached-app");
+    let loose = seed.home.join("loose");
+    let files: [(&Path, &str, &str); 10] = [
+        (&mapped, ".base-ast/ast.ttl", "# a stub map: the hint reads only that one exists\n"),
+        (&mapped, "src/lib.rs", "// TODO: select\npub fn select() {}\n"),
+        (&mapped, "src/hook/mod.rs", "pub fn handle() { crate::user_prompt_submit::handle(); }\n"),
+        (&mapped, "api/routes/users.ts", "export const users = 1;\n"),
+        (&mapped, "docs/guide.md", "# guide\n\nselect\n"),
+        (&plain, "src/main.rs", "fn main() {}\n"),
+        (&cached, "src/main.rs", "fn main() {}\n"),
+        (&loose, "x.rs", "fn x() {}\n"),
+        (&seed.home, ".base-gbl/handoffs/one.md", "# one\n\nDUE NOW\n"),
+        (&seed.home, ".base-gbl/extra.toml", "[budget]\nprompt_bytes = 10000\n"),
+    ];
+    for (root, rel, text) in files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("app folder");
+        std::fs::write(&path, text).expect("app file");
+    }
+    for app in [&mapped, &plain, &cached] {
+        std::fs::create_dir_all(app.join(".git")).expect(".git");
+    }
+    std::fs::create_dir_all(seed.home.join("notes")).expect("notes");
+    std::fs::write(seed.home.join("notes").join("plan.md"), "# plan\n").expect("notes/plan.md");
+    Apps { mapped, plain, cached, loose }
+}
+
 /// Any other `base` command, from the seeded workspace.
 pub fn run_base(seed: &Seed, args: &[&str]) -> (i32, String, String) {
     run(seed, args, None, None)
+}
+
+/// A `base` command run the way a session's Bash tool runs it: `CLAUDE_CODE_SESSION_ID` names the
+/// session, as Claude Code sets it.
+pub fn run_base_in_session(seed: &Seed, args: &[&str], session: &str) -> (i32, String, String) {
+    let mut cmd = Command::new(BIN);
+    cmd.args(args)
+        .current_dir(&seed.ws)
+        .env("BASE_HOME", &seed.home)
+        .env("BASE_NO_AUTO_UPDATE", "1")
+        .env("BASE_AST_NO_SPAWN", "1")
+        .env_remove("BASE_RELAY_AS")
+        // Set inside base's own headless calls, where every hook returns at once (BO-08, F27).
+        .env_remove("BASE_HEADLESS")
+        .env_remove("WT_SESSION")
+        .env("CLAUDE_CODE_SESSION_ID", session)
+        .env_remove("CLAUDECODE")
+        .stdin(Stdio::null());
+    let out = cmd.output().expect("the base binary runs");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// UTF-16 units.
@@ -459,4 +623,115 @@ pub fn measured(s: &str) -> String {
         units(s),
         s.lines().count()
     )
+}
+
+/// One block of a session's prompt blocks file, `.base/hook-output/<session>/prompt-blocks.json` (BO-01).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PromptRow {
+    pub id: String,
+    pub priority: u8,
+    pub items: usize,
+    pub noun: String,
+    pub bytes: usize,
+    pub printed: bool,
+    pub text: String,
+    /// A ranked block printed with some rules withheld (BO-18): how many, their bytes, and the text as printed.
+    #[serde(default)]
+    pub withheld_items: Option<usize>,
+    #[serde(default)]
+    pub withheld_bytes: Option<usize>,
+    #[serde(default)]
+    pub printed_text: Option<String>,
+}
+
+/// A session's prompt blocks file: every block the prompt hook built on the session's last prompt.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PromptBlocksFile {
+    pub budget_bytes: usize,
+    pub blocks: Vec<PromptRow>,
+    /// The held-back list printed after the blocks (BO-31), when the prompt printed one.
+    #[serde(default)]
+    pub held_back: Option<String>,
+}
+
+/// `session`'s prompt blocks file in the workspace `ws`.
+pub fn prompt_blocks(ws: &Path, session: &str) -> PromptBlocksFile {
+    let path = ws.join(".base").join("hook-output").join(session).join("prompt-blocks.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// The line a dropped block leaves, built from its row the way the hook builds it.
+pub fn pointer_line(row: &PromptRow, budget: usize) -> String {
+    let counted = if row.items == 1 { format!("1 {}", row.noun) } else { format!("{} {}s", row.items, row.noun) };
+    format!(
+        "[base: withheld {} ({counted}, {} bytes) over [budget] prompt_bytes = {budget} · full text: base hooks show {}]",
+        row.id,
+        base::emit::prompt::thousands(row.bytes),
+        row.id
+    )
+}
+
+/// The text a partly printed ranked block printed (BO-18), checked against its full text rather than trusted: some of
+/// the full text's lines, in their order, then one line in the pointer line's shape naming how many of its rules it
+/// withheld out of how many, and their bytes (lynx's G0 verdict on BO-18, Q1 condition 1).
+pub fn partial_text(row: &PromptRow, budget: usize) -> String {
+    let (Some(n), Some(bytes), Some(printed)) = (row.withheld_items, row.withheld_bytes, row.printed_text.as_ref()) else {
+        panic!("{}: a partly printed block without its withheld count, bytes and printed text", row.id);
+    };
+    let line = format!(
+        "[base: withheld {n} of {} {} ({} bytes) over [budget] prompt_bytes = {budget} · full text: base hooks show {}]",
+        row.items,
+        row.id,
+        base::emit::prompt::thousands(bytes),
+        row.id
+    );
+    let body = printed.strip_suffix(&line).unwrap_or_else(|| panic!("{}: does not end with {line:?}:
+{printed}", row.id));
+    let mut full = row.text.lines();
+    for l in body.lines() {
+        assert!(full.any(|f| f == l), "{}: printed line {l:?} is not a line of its full text, in order", row.id);
+    }
+    printed.clone()
+}
+
+/// What the prompt hook must have printed, rebuilt from its blocks file: the `<context-bracket>` line when `stdout`
+/// starts with one, then every block whole, or as printed with rules withheld ([`partial_text`], BO-18), or its pointer
+/// line, then the held-back list when there is one (BO-31), a blank line between, one newline at the end.
+pub fn rebuilt_prompt_output(stdout: &str, file: &PromptBlocksFile) -> String {
+    let header = stdout.lines().next().filter(|l| l.starts_with("<context-bracket>")).unwrap_or("");
+    let mut parts: Vec<String> = Vec::new();
+    if !header.is_empty() {
+        parts.push(header.to_string());
+    }
+    for row in &file.blocks {
+        parts.push(match (row.printed, row.withheld_items) {
+            (true, Some(_)) => partial_text(row, file.budget_bytes),
+            (true, None) => row.text.clone(),
+            (false, _) => pointer_line(row, file.budget_bytes),
+        });
+    }
+    // BO-31: the held-back list goes last, after a blank line, as the hook printed it.
+    parts.extend(file.held_back.clone());
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", parts.join("\n\n"))
+}
+
+/// Every file under `root` with its size and modified time: a run that wrote anything at all changes this (BO-08).
+pub fn files_under(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, (u64, std::time::SystemTime)> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("readable folder").flatten() {
+            let meta = entry.metadata().expect("metadata");
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                out.insert(entry.path(), (meta.len(), meta.modified().expect("mtime")));
+            }
+        }
+    }
+    out
 }

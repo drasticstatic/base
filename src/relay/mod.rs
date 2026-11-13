@@ -101,6 +101,81 @@ pub struct Claims {
     pub claims: BTreeMap<String, Claim>,
 }
 
+/// A relay side effect held back until the text announcing it is printed: marking a message seen, deleting a reply
+/// once announced, recording a ping as delivered, stamping a wake-nudge throttle.
+///
+/// BO-01. The prompt hook fits its output to a byte budget AFTER the relay blocks are built, and may drop one whole.
+/// Delivery used to consume as it rendered, so a dropped block's messages were marked seen, its replies deleted and
+/// its wake nudge throttled, and the reader never saw them. The prompt hook now runs these only for the blocks it
+/// printed; a dropped block stays pending and arrives at the next tool call or prompt. Every other caller runs them
+/// at once, as before.
+pub type Commit = Box<dyn FnOnce()>;
+
+/// Run held-back relay side effects.
+pub fn run_commits(commits: Vec<Commit>) {
+    for commit in commits {
+        commit();
+    }
+}
+
+/// One relay block as a hook builds it: the text, the side effects to run only if it is printed (BO-01), and how many
+/// messages, tasks or titles it carries, counted where they are rendered rather than guessed from its lines (a message
+/// body may itself begin `relay: `).
+pub struct Part {
+    pub text: String,
+    pub commits: Vec<Commit>,
+    pub items: usize,
+}
+
+impl Part {
+    /// Run the side effects and keep the text: for the hooks that print a part whole.
+    pub fn commit(self) -> String {
+        run_commits(self.commits);
+        self.text
+    }
+}
+
+/// True when this hook process runs in a harness that has said it cannot keep an inbox watcher (`BASE_NO_WAKE_NUDGE`,
+/// the documented opt-out for Agent SDK runs and workers with no Monitor tool). Only such a run is given new relay
+/// items on a tool call (BO-04, lynx's amendment to F13b): it has no other way to hear a question mid-run. Interactive
+/// sessions never are; `BASE_RELAY_AS` does not mark one, because the operator's own launchers set it on every
+/// interactive session.
+pub fn monitorless() -> bool {
+    std::env::var_os("BASE_NO_WAKE_NUDGE").is_some()
+}
+
+/// A sender whose messages are each a thread of their own, so nothing it sends supersedes anything else: no title at
+/// all, or the placeholder a session with no title is recorded under. Two unrelated scripts both recorded as
+/// `unregistered` are not one conversation.
+pub fn threadless(from: &str) -> bool {
+    from.trim().is_empty() || from.starts_with(UNREGISTERED)
+}
+
+/// BO-04, F13c, in one place for both delivery paths: of the items in one thread (one sender within one receiver's
+/// inbox), only the newest is shown. `keys[i]` is item i's thread, or `None` for an item that is never superseded.
+/// Items are oldest first. Returns, per item, the index of the newer item it is hidden behind, or `None` when shown.
+pub fn superseded_by<K: Eq + std::hash::Hash>(keys: &[Option<K>]) -> Vec<Option<usize>> {
+    let mut newest: std::collections::HashMap<&K, usize> = std::collections::HashMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        if let Some(k) = k {
+            newest.insert(k, i);
+        }
+    }
+    keys.iter()
+        .enumerate()
+        .map(|(i, k)| k.as_ref().and_then(|k| Some(newest[k]).filter(|&n| n != i)))
+        .collect()
+}
+
+/// The line under a shown message that hid `n` older ones from `from`, naming the command that still lists them, so a
+/// hidden message is never lost silently (lynx's condition 1 on F13c).
+pub fn hidden_line(n: usize, from: &str, command: &str) -> String {
+    format!(
+        "({n} earlier message{} from {from} hidden, this one is newer: {command})\n",
+        if n == 1 { "" } else { "s" }
+    )
+}
+
 // ─── Store handle ────────────────────────────────────────────
 
 pub struct RelayStore {
@@ -304,19 +379,23 @@ impl RelayStore {
         titles
     }
 
-    /// Unseen messages addressed to `title`. Does NOT mark seen.
-    pub fn pending_for(&self, title: &str) -> Vec<Message> {
+    /// Every message addressed to `title` from another sender, seen or not, oldest first.
+    pub fn addressed(&self, title: &str) -> Vec<Message> {
         let reg = self.load_registry();
         let entry = reg.sessions.get(title);
         let session_id = entry.and_then(|e| e.session_id.as_deref());
         let phase = entry.and_then(|e| e.phase.as_deref());
-        let seen = self.load_seen(title);
         self.all_messages()
             .into_iter()
             .filter(|m| m.from != title)
             .filter(|m| Self::addressed_to(m, title, session_id, phase))
-            .filter(|m| !seen.contains(&m.id))
             .collect()
+    }
+
+    /// Unseen messages addressed to `title`. Does NOT mark seen.
+    pub fn pending_for(&self, title: &str) -> Vec<Message> {
+        let seen = self.load_seen(title);
+        self.addressed(title).into_iter().filter(|m| !seen.contains(&m.id)).collect()
     }
 
     pub fn mark_seen(&self, title: &str, ids: &[String]) -> Result<()> {
@@ -565,6 +644,24 @@ pub fn resolve_store(cwd: &Path, project: Option<&str>) -> Result<RelayStore> {
     }
 }
 
+/// Every relay title this machine knows: the global session registry, its title history, and the registry of each
+/// relay store found from `cwd`. A codename in a handoff slug is matched against these (BO-11). The global registry
+/// alone is not enough: on Chris's machine it held 42 titles while the workspace's store held 291, and most old
+/// handoffs were written by sessions only the store still names.
+pub fn known_titles(cwd: &Path) -> Vec<String> {
+    let mut titles: Vec<String> = session_registry::list().into_iter().map(|e| e.title).collect();
+    titles.extend(session_registry::history_titles());
+    if let Some(root) = relay_root(cwd) {
+        for project in list_projects(&root) {
+            let store = RelayStore { root: root.join(&project), project };
+            titles.extend(store.load_registry().sessions.into_values().map(|e| e.title));
+        }
+    }
+    titles.sort();
+    titles.dedup();
+    titles
+}
+
 pub fn list_projects(relay_root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(relay_root) else {
         return Vec::new();
@@ -581,6 +678,15 @@ pub fn list_projects(relay_root: &Path) -> Vec<String> {
 /// The current session id, as exposed to Bash tool subprocesses.
 pub fn env_session_id() -> Option<String> {
     std::env::var("CLAUDE_CODE_SESSION_ID").ok().filter(|s| !s.is_empty())
+}
+
+/// The session sending as `origin`, recorded on what it sends (BO-05, F12d): this process's session when it holds that
+/// title now, else empty. A process sending as a title it does not hold (a script's `--from chris`) records nothing, so
+/// a notice about what it sent goes to that title's holder.
+pub fn sending_session(origin: &str) -> String {
+    env_session_id()
+        .filter(|sid| session_registry::resolve(origin).is_some_and(|e| &e.session_id == sid))
+        .unwrap_or_default()
 }
 
 // ─── Helpers ─────────────────────────────────────────────────
@@ -658,6 +764,19 @@ pub fn age_str(ts: &str) -> String {
         60..=3599 => format!("{}m", secs / 60),
         3600..=86399 => format!("{}h", secs / 3600),
         _ => format!("{}d", secs / 86400),
+    }
+}
+
+/// When a relay item was sent, as a reader names it: `14:05` today, `10-01 14:05` before today, `?` unreadable. The
+/// hooks show pings with this rather than an age, which goes stale the moment it is printed (BO-04).
+pub fn clock(ts: &str) -> String {
+    let Some(t) = parse_ts(ts) else {
+        return "?".into();
+    };
+    if t.date_naive() == chrono::Local::now().date_naive() {
+        t.format("%H:%M").to_string()
+    } else {
+        t.format("%m-%d %H:%M").to_string()
     }
 }
 

@@ -8,7 +8,18 @@ use crate::manifest::{self, Manifest};
 /// The generic star-command pack offered at install. A fresh install otherwise
 /// ships zero commands, which leaves a new user with the machinery and no idea
 /// what to type first.
-const STARTER_COMMANDS: &str = include_str!("starter-commands.toml");
+pub const STARTER_COMMANDS: &str = include_str!("starter-commands.toml");
+
+/// Every starter pack an earlier base shipped, oldest first, with the releases that shipped it: the text of
+/// `src/starter-commands.toml` at each commit that changed it (`git log --follow`), read against the release tags.
+/// The upgrade replaces a command block of a user's `commands.toml` that is still one of these, unedited, with this
+/// build's (BO-26, U3). When `starter-commands.toml` changes, the text it replaces is added here, or users who never
+/// edited the pack keep the old text forever; `the_starter_pack_history_ends_at_the_current_pack` fails until it is.
+pub const STARTER_COMMANDS_SHIPPED: [(&str, &str); 3] = [
+    ("0.13.0 to 0.14.1", include_str!("starter-commands/0.13.0.toml")),
+    ("0.14.2 to 0.15.2", include_str!("starter-commands/0.14.2.toml")),
+    ("the dev builds of 2026-09-20", include_str!("starter-commands/dev-2026-09-20.toml")),
+];
 
 /// What to do about the starter star commands: ask (interactive default),
 /// or a decision already made by flag for unattended installs.
@@ -25,6 +36,7 @@ pub fn run(
     skip_hooks: bool,
     full: bool,
     starter: StarterCommands,
+    corrections: crate::corrections::claude_md::Choice,
 ) -> Result<()> {
     let home = crate::home::home_root().context("Cannot determine home directory")?;
     let binary_path = std::env::current_exe().context("Cannot determine binary path")?;
@@ -97,6 +109,12 @@ pub fn run(
     // Step 8: Append BASE CLI section to ~/.claude/CLAUDE.md
     let claude_md = home.join(".claude").join("CLAUDE.md");
     append_claude_md(&claude_md)?;
+
+    // Step 8b (BO-15, C3 for every user): one line asking the AI to start a corrected reply with CORRECTED:, offered
+    // when the user's CLAUDE.md asks for no marker. Declined, or no terminal to ask on: session start carries it.
+    let offered =
+        crate::corrections::claude_md::offer(&claude_md, corrections, crate::corrections::claude_md::ask_on_terminal);
+    println!("{}\n", crate::corrections::claude_md::report(&offered));
 
     // #93: step 3 could not wire because ~/.claude did not exist yet. Steps 7
     // and 8 have since created it — for base's own bundled skill, then for
@@ -325,10 +343,19 @@ fn remove_claude_md_section(claude_md_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(claude_md_path)?;
+    let original = std::fs::read_to_string(claude_md_path)?;
+    // The corrections line base offered at install (BO-15) goes with the section.
+    let content = crate::corrections::claude_md::remove_line(&original);
 
     if !content.contains("## BASE CLI") {
-        println!("not present — skipped");
+        if content != original {
+            let tmp = claude_md_path.with_extension("md.tmp");
+            std::fs::write(&tmp, &content)?;
+            std::fs::rename(&tmp, claude_md_path)?;
+            println!("✓ removed the corrections line (no BASE CLI section)");
+        } else {
+            println!("not present — skipped");
+        }
         return Ok(());
     }
 
@@ -487,8 +514,9 @@ uri = "http://ops-sys.local/ontology#"
 
 # ─── [devmode] — per-response diagnostics ────────────────────
 # Appends a 🔧 DEVMODE block (loaded domains + context bracket) to each response.
+# Off by default. Turn it on while tuning a domain: base config set devmode.enabled true
 [devmode]
-enabled = true            # false = no diagnostic block
+enabled = false           # true = a diagnostic block on every response
 
 # ─── [bracket] — context-window pressure tiers ───────────────
 # Scales how much gets injected as the context window fills.
@@ -521,12 +549,18 @@ refresh_interval = 5      # re-survey window pressure every N prompts
 # rule that must hold regardless of subject — it silently stops applying the moment
 # the conversation drifts off its triggers. These inject on the TIER alone.
 #
-# `always` goes out every prompt at every tier: the layer that survives a long
-# session because it is re-sent, not remembered. Tier buckets are ADDITIVE with it,
-# so a DEPLETED prompt receives always + depleted. Never deduped.
+# `always` applies at every tier; tier buckets are ADDITIVE with it, so a DEPLETED
+# prompt receives always + depleted. Each rule is sent ONCE per session, on the first
+# prompt where its tier applies; a tier change sends only the new tier's rules.
+#
+# A rule your CLAUDE.md already carries need not be sent at all: write it as a table
+# with `covered_by`, a line of text from that CLAUDE.md (or a list of them). When
+# every listed line is in a CLAUDE.md Claude Code loads for the session, the rule is
+# skipped.
 #
 # [bracket.rules]
-# always   = ["A rule that must never erode, with its BECAUSE attached."]
+# always   = ["A rule that must never erode, with its BECAUSE attached.",
+#             { text = "Never hedge; give a 1-5 confidence.", covered_by = "T1: Confidence is numeric" }]
 # fresh    = ["Room to spare — fuller guidance here."]
 # moderate = ["Condensed."]
 # depleted = ["Terse. Prefer precision over coverage."]
@@ -546,12 +580,96 @@ enabled = true            # master switch for all session-start injection
 # Claude Code saves hook output over its limit to a file and shows Claude only
 # the first 2,000 characters. base measures what it is about to print, in BYTES
 # (the unit the host counts), and cuts the bottom blocks to one line each,
-# naming where the rest is. Measured on Claude Code 2.1.278, 2026-09-20. The old
-# [signal] max_chars is read by nothing.
+# naming where the rest is. Measured on Claude Code 2.1.287, 2026-10-01; when
+# Claude Code updates, `base doctor --measure` re-measures and rewrites these.
+# The old [signal] max_chars is read by nothing.
 [budget]
-session_start_bytes = 9000   # everything session start prints, in bytes
+session_start_bytes = 10000  # everything session start prints, in bytes
+measured_on = "2.1.287"      # the Claude Code the number above was measured on
 memory_chars = 4000          # the memory block inside it, in whole notes
-write_full_output = true     # the untrimmed session start also goes to .base/last-session-start.md
+write_full_output = true     # untrimmed hook output also goes to .base/hook-output/<session>/
+
+# ─── [log] — how long base keeps what came from your prompts ──
+# Each session's own hook output (its full session start, its last prompt's
+# output, its handoff letters) is kept in .base/hook-output/<session id>/.
+# Session start removes a session's folder once untouched this many days.
+# .base/match-log.jsonl records what every prompt and file touch matched,
+# what was served and what was cut (`base log matches`); session start
+# removes its rows older than the same number of days. It stays on this
+# machine, and secrets (API keys, tokens, passwords, private keys) are
+# replaced with [SECRET:<kind>] before anything is written.
+# prompt_text: "full" keeps each prompt, "matched" only the words that
+# matched a keyword or rule, "off" no prompt text at all.
+[log]
+prompt_days = 90
+prompt_text = "full"
+
+# ─── [doctor] — what `base doctor` calls stale ───────────────
+# A project's next step older than this many days is flagged, with the
+# command that rewrites it. Steps written before 0.16.0 carry no date and
+# are flagged as undated.
+# From the match log, doctor also lists the rules no prompt served in
+# dead_days days, the rules and decisions served and then corrected at least
+# ignored_after times and twice as often as the log's average, and the
+# decisions served review_served times with no
+# update in review_days days ("still true?"). Advice only: none of it changes
+# the verdict. Noisy domains use [tune] broad_share.
+[doctor]
+stale_next_days = 14
+dead_days = 30
+ignored_after = 3
+review_served = 20
+review_days = 60
+
+# ─── [corrections] — noticing when you correct the AI ────────
+# No one signal decides. A phrase in your prompt (phrases), what you did (an
+# interrupt, a refused tool call, a file the AI wrote changed after its turn,
+# the same request again) and the AI's own marker at the start of a reply line
+# (markers) each flag a turn; the next prompt then asks the AI, in one line,
+# to run `base rule propose --from-turn` if it was a correction. Every flag is
+# a row in .base/match-log.jsonl (`base log corrections`).
+# markers: UPDATED and CORRECTED mean the AI was wrong, MISREAD that it
+# misunderstood, DEFERRED that it held its position (logged, never proposed).
+# repeat_similarity: the share of words two prompts in a row must share to
+# count as the same request again.
+[corrections]
+enabled = true
+phrases = ["no,", "wrong", "that's not", "not what i asked", "i told you", "i've said", "i said", "again", "quit",
+           "stop doing", "don't", "never", "why did you", "fuck", "fucking", "fucked", "shit", "bullshit", "damn",
+           "dammit", "goddamn", "wtf", "ffs", "crap"]
+markers = ["CORRECTED:", "UPDATED:", "MISREAD:", "DEFERRED:"]
+repeat_similarity = 0.5
+
+# ─── [tune] — checking rule changes, and when the rule pass runs ───
+# `base rule replay` and `base rule review` run a proposed change over your
+# last replay_prompts prompts in .base/match-log.jsonl and say which prompts
+# would start or stop serving the rule. A change served on more than
+# broad_share of them (0.25 = 25%) is flagged TOO BROAD.
+# `base tune` reads your recent sessions and writes rule proposals for review.
+# Your next prompt asks the AI to run it once `corrections` flagged
+# corrections have piled up since the last pass, or after `turns` prompts
+# with no pass when one correction or one prompt that matched no domain was
+# logged since. A hook never runs it: hooks only count.
+[tune]
+replay_prompts = 500
+broad_share = 0.25
+corrections = 3   # flagged corrections that make a rule pass due
+turns = 15        # prompts with no pass before the safety net fires
+
+# ─── [match] — ranking rules against each prompt (BM25) ──────
+# A rule whose domain keyword or touched path matches is always served, as
+# before. Each prompt is also scored against every rule and global decision:
+# shared words count, rare ones more than common ones (BM25). Blocks list their
+# rules best first, so a tight [budget] withholds the weakest first. The scores
+# are counted at session start and when a rule, keyword or test prompt changes,
+# into .base/bm25-index.json; every score is in .base/match-log.jsonl.
+# bm25 = false serves by keyword only, exactly as before.
+# min_score, when set, also serves a rule no keyword brought once its score
+# reaches it. Unset, none is: on a real store no value told the rules a prompt
+# was about from the rest (scores grow with a prompt's length).
+[match]
+bm25 = true
+# min_score = 25.0
 
 # ─── [sync] — graph extraction globs ─────────────────────────
 # Which files `base sync` reads to extract metadata/AST into the graph.
@@ -782,13 +900,24 @@ description = "One-line description of what this extension does"  # Required.
 /// thing. A second hand-maintained copy is the whole failure this constant
 /// exists to prevent: it would drift, and the drift would surface as hooks that
 /// look installed and never fire.
-pub const HOOK_TABLE: [(&str, &str); 5] = [
+pub const HOOK_TABLE: [(&str, &str); 6] = [
     ("SessionStart", "base hook session-start"),
     ("UserPromptSubmit", "base hook user-prompt-submit"),
     ("PreToolUse", "base hook pre-tool-use"),
     ("PostToolUse", "base hook post-tool-use"),
     ("Stop", "base hook stop"),
+    // BO-17, D7d: marks the session ended for the next rule pass, and nothing else.
+    ("SessionEnd", "base hook session-end"),
 ];
+
+/// [`HOOK_TABLE`], hashed: the first 8 hex characters of its SHA-256. Part of the wired stamp, so a build that adds a hook
+/// wires it at the next session start even when the version string did not change (BO-17: dev builds keep Cargo.toml's
+/// version, and a home stamped for that version would never get the new hook).
+pub fn hook_table_hash() -> String {
+    use sha2::{Digest, Sha256};
+    let text: String = HOOK_TABLE.iter().map(|(e, c)| format!("{e}={c}\n")).collect();
+    Sha256::digest(text.as_bytes())[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// The object base pushes into `settings.hooks[event]` for one hook.
 ///
@@ -880,6 +1009,11 @@ fn wire_hooks(settings_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// The file under `~/.base-gbl` that says this build's hooks are wired: `.hooks-wired-<version>-<table hash>`.
+pub fn hooks_wired_stamp() -> String {
+    format!(".hooks-wired-{}-{}", env!("CARGO_PKG_VERSION"), hook_table_hash())
+}
+
 /// Session start: wire any hook this release added that the host's
 /// settings.json lacks, once per version. The auto-update swaps the binary and
 /// touches nothing else, so without this a release that adds a hook ships a
@@ -890,9 +1024,7 @@ pub fn ensure_hooks_wired() -> Vec<&'static str> {
     let Some(home) = crate::home::home_root() else {
         return Vec::new();
     };
-    let stamp = home
-        .join(".base-gbl")
-        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")));
+    let stamp = home.join(".base-gbl").join(hooks_wired_stamp());
     if stamp.exists() {
         return Vec::new();
     }
@@ -906,9 +1038,30 @@ pub fn ensure_hooks_wired() -> Vec<&'static str> {
     if !claude_config_tier(&settings) {
         return Vec::new();
     }
-    let added = wire_hooks_quiet(&settings).unwrap_or_default();
-    let _ = std::fs::write(&stamp, b"");
-    added
+    // A file base could not add to without rewriting it (BO-17) is left unstamped, and the error goes to stderr rather
+    // than vanishing. This runs on every base command too (cli.rs), so a failure leaves `<stamp>.failed`: the next try,
+    // and its one stderr line, wait a day instead of repeating on every command.
+    let failed = stamp.with_file_name(format!("{}.failed", hooks_wired_stamp()));
+    let recent_failure = std::fs::metadata(&failed)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < std::time::Duration::from_secs(24 * 60 * 60));
+    if recent_failure {
+        return Vec::new();
+    }
+    match wire_hooks_quiet(&settings) {
+        Ok(added) => {
+            let _ = std::fs::write(&stamp, b"");
+            let _ = std::fs::remove_file(&failed);
+            added
+        }
+        Err(e) => {
+            eprintln!("base: could not wire hooks into {} (next try in a day): {e:#}", settings.display());
+            let _ = std::fs::write(&failed, format!("{e:#}\n"));
+            Vec::new()
+        }
+    }
 }
 
 /// Merge every hook in [`HOOK_TABLE`] that `settings_path` lacks and return
@@ -916,8 +1069,14 @@ pub fn ensure_hooks_wired() -> Vec<&'static str> {
 /// does not — a fresh Claude Code install has `~/.claude/` before it has a
 /// settings.json — and left alone when the directory is missing too.
 /// Append-only: entries base did not write are never touched.
+///
+/// AS TEXT, AND BACKED UP FIRST (BO-17, lynx's G0 ruling). The file is the user's: their own hooks, permissions and
+/// settings. The new entries are inserted as text ([`crate::settings_json::add_hook_entries`]) so every other byte stays
+/// as it was, and the old file is copied to `settings.json.bak-base-<when>` before the one write. A file that cannot be
+/// changed that way is not written at all: the error says what to add by hand.
 pub fn wire_hooks_quiet(settings_path: &Path) -> Result<Vec<&'static str>> {
-    if !settings_path.exists() {
+    let created = !settings_path.exists();
+    if created {
         match settings_path.parent() {
             Some(dir) if dir.is_dir() => std::fs::write(settings_path, "{}\n")
                 .with_context(|| format!("creating {}", settings_path.display()))?,
@@ -926,59 +1085,40 @@ pub fn wire_hooks_quiet(settings_path: &Path) -> Result<Vec<&'static str>> {
     }
 
     let content = std::fs::read_to_string(settings_path)?;
-    let mut settings: serde_json::Value = serde_json::from_str(&content)
+    let settings: serde_json::Value = serde_json::from_str(&content)
         .context("Failed to parse settings.json")?;
 
-    let hook_entries = HOOK_TABLE;
-
-    // Check if already fully wired
-    let all_present = hook_entries.iter().all(|(_, cmd)| content.contains(cmd));
-    if all_present {
+    // A command already in the file, anywhere, is never added again: the same text test the earlier releases used,
+    // and an entry the user moved or wrapped still counts as wired.
+    let missing: Vec<(&'static str, &'static str)> =
+        HOOK_TABLE.iter().copied().filter(|(_, cmd)| !content.contains(cmd)).collect();
+    if missing.is_empty() {
         return Ok(Vec::new());
     }
-
-    let hooks = settings
-        .as_object_mut()
-        .context("settings.json is not an object")?
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let hooks_obj = hooks
-        .as_object_mut()
-        .context("hooks is not an object")?;
-
-    let mut added = Vec::new();
-
-    for (event, command) in &hook_entries {
-        // Skip if this specific hook is already present
-        if content.contains(command) {
-            continue;
-        }
-
-        let event_hooks = hooks_obj
-            .entry(*event)
-            .or_insert_with(|| serde_json::json!([]));
-
-        if !event_hooks.is_array() {
-            *event_hooks = serde_json::json!([]);
-        }
-
-        let arr = event_hooks.as_array_mut().unwrap();
-
-        // The manifest publishes this exact value; build it in one place so an
-        // external installer cannot merge something base would not have written.
-        arr.push(hook_entry(command));
-
-        added.push(*event);
+    if !settings.is_object() {
+        anyhow::bail!("{} is not a JSON object", settings_path.display());
     }
+    let entries: Vec<(&str, serde_json::Value)> = missing.iter().map(|(e, c)| (*e, hook_entry(c))).collect();
+    let Some(updated) = crate::settings_json::add_hook_entries(&content, &entries) else {
+        let wanted: Vec<String> = missing.iter().map(|(e, c)| format!("{e}: {c}")).collect();
+        anyhow::bail!(
+            "{} could not take base's hook entries without rewriting the rest of it, so nothing was written; add these under \"hooks\" by hand: {}",
+            settings_path.display(),
+            wanted.join("; ")
+        );
+    };
 
-    // Write back atomically
+    if !created {
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let backup = settings_path.with_extension(format!("json.bak-base-{stamp}"));
+        std::fs::copy(settings_path, &backup)
+            .with_context(|| format!("backing up {} to {}", settings_path.display(), backup.display()))?;
+    }
     let tmp_path = settings_path.with_extension("json.tmp");
-    let formatted = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&tmp_path, &formatted)?;
+    std::fs::write(&tmp_path, &updated)?;
     std::fs::rename(&tmp_path, settings_path)?;
 
-    Ok(added)
+    Ok(missing.into_iter().map(|(e, _)| e).collect())
 }
 
 // ─── Step 4: Migrate CARL ───────────────────────────────────
@@ -1592,7 +1732,7 @@ The `base` binary is on PATH. Use these commands proactively during sessions —
 | Discover which apps have a code map | `base ast list` |
 | A decision is made (architectural, process, tooling) | `base decision log --domain X --decision "..." --rationale "..."` |
 | An insight, correction, or lesson emerges | `base learn --text "..." --domain X --type insight\|correction\|decision` |
-| User defines or refines a behavioral rule | `base rule add --domain X --text "..."` |
+| User defines or refines a behavioral rule | `base rule add --domain X --text "..." --keywords "a, b" --fires-on "<the user's prompt>"` |
 | Before making assumptions about prior context | `base recall --keyword "..."` or `base recall --domain X` |
 | User asks to scaffold a new workspace | `base scaffold [path]` |
 
@@ -1650,7 +1790,7 @@ Config: `[defer] enabled` (off unless set), `mode` (`"asset"` or `"global"`), `g
 - `base recall --keyword "..." [--domain X]` — graph-backed relational search
 - `base decision log --domain X --decision "..." --rationale "..."` — log a decision
 - `base decision search --keyword "..."` — find prior decisions
-- `base rule add --domain X --text "..."` — add a rule to a domain
+- `base rule add --domain X --text "..." --keywords "a, b" --fires-on "<prompt>"` — add a rule to a domain; inside a session it needs the words from the prompt that should bring it back and that prompt as its first test (a rule for file work also takes `--path`)
 
 ### Sync & dashboard
 
@@ -1947,6 +2087,24 @@ pub fn ensure_claude_md_current() -> Option<ClaudeMdRefresh> {
 mod tests {
     use super::*;
     use crate::config::BracketConfig;
+
+    /// BO-26 (U3): an upgrade brings a user's unedited starter commands up to [`STARTER_COMMANDS`] only from a text in
+    /// [`STARTER_COMMANDS_SHIPPED`]. So a change to `src/starter-commands.toml` must add the text it replaces there, and
+    /// then update this hash; until both are done this fails. Line endings do not count (a Windows checkout is CRLF).
+    #[test]
+    fn the_starter_pack_history_ends_at_the_current_pack() {
+        use sha2::{Digest, Sha256};
+        let normal = |t: &str| t.replace("\r\n", "\n");
+        let hash: String =
+            Sha256::digest(normal(STARTER_COMMANDS).as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hash, "32d15e38170ec8390cd8d70fb8a25580e8f3b6078ebe860deae1bfbc68905e48",
+            "src/starter-commands.toml changed: add the text it replaces to STARTER_COMMANDS_SHIPPED, then update this hash"
+        );
+        for (shipped, text) in STARTER_COMMANDS_SHIPPED {
+            assert_ne!(normal(text), normal(STARTER_COMMANDS), "{shipped} is the current pack, not an earlier one");
+        }
+    }
 
     fn write(dir: &Path, body: &str) -> std::path::PathBuf {
         let p = dir.join("base.toml");

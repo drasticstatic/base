@@ -24,7 +24,7 @@ mod seed;
 
 use std::path::Path;
 
-use seed::{run_base, run_session_start};
+use seed::{run_base, run_base_in_session, run_session_start};
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
@@ -121,6 +121,45 @@ fn line_with<'a>(haystack: &'a str, needle: &str) -> Option<&'a str> {
     haystack.lines().find(|l| l.contains(needle))
 }
 
+/// The workspace graph's lines for reminder `slug` and predicate `pred`, as the store wrote them.
+fn quads(seed: &seed::Seed, slug: &str, pred: &str) -> Vec<String> {
+    let path = seed.ws.join(".base").join("graph.nq");
+    let key = format!("<{ns}reminder/{slug}> <{ns}{pred}> ", ns = seed::NS);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .lines()
+        .filter(|l| l.starts_with(&key))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Move the time session start recorded for reminder `slug`'s first shown warning (BO-27, V4) `days` into the past,
+/// as if that session start had run `days` ago. The one way to reach a later day in a test.
+fn backdate_warned(seed: &seed::Seed, slug: &str, days: i64) {
+    let path = seed.ws.join(".base").join("graph.nq");
+    let key = format!("<{ns}reminder/{slug}> <{ns}warnedAt> \"", ns = seed::NS);
+    let when = (chrono::Local::now() - chrono::Duration::days(days)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let text = std::fs::read_to_string(&path).expect("workspace graph");
+    let mut moved = 0;
+    let out: Vec<String> = text
+        .lines()
+        .map(|l| match l.strip_prefix(&key).and_then(|rest| rest.find('"').map(|end| &rest[end..])) {
+            Some(tail) => {
+                moved += 1;
+                format!("{key}{when}{tail}")
+            }
+            None => l.to_string(),
+        })
+        .collect();
+    assert_eq!(moved, 1, "one warnedAt line for {slug} in the workspace graph:\n{text}");
+    std::fs::write(&path, out.join("\n") + "\n").expect("workspace graph write");
+}
+
+/// The lines session start printed about reminders the auto-archive pass archived.
+fn archive_lines(stdout: &str) -> Vec<&str> {
+    stdout.lines().filter(|l| l.starts_with("base: We archived your reminder ")).collect()
+}
+
 /// Output is asserted non-empty before anything else: an empty stdout with a zero exit code
 /// would otherwise satisfy every `!contains` assertion for the wrong reason.
 fn assert_nonempty(what: &str, stdout: &str, stderr: &str) {
@@ -152,9 +191,10 @@ fn day_8_shows_the_archive_date_and_the_reset_command() {
         warned_line.contains(&format!("archives {archives_on}")),
         "no archive date on the day-8 line: {warned_line}"
     );
+    // By its DUE NOW number since BO-00 B4: DUE NOW sorts oldest due first, so the 8-day reminder is 1.
     assert!(
-        warned_line.contains(&format!("base reminder snooze {}", warned.slug)),
-        "no reset command on the day-8 line: {warned_line}"
+        warned_line.starts_with("  1 ") && warned_line.contains("base reminder snooze 1 <duration>"),
+        "no reset command naming the line's own number on the day-8 line: {warned_line}"
     );
 
     let quiet_line = line_with(&stdout, &quiet.name)
@@ -168,11 +208,20 @@ fn day_8_shows_the_archive_date_and_the_reset_command() {
 // ── R2 ───────────────────────────────────────────────────────────────────────
 /// J5.2: at 10 whole days past due the reminder is archived and KEPT. Control: a 9-day twin is
 /// still live, so the assertion reads the threshold and not "everything got archived".
+///
+/// BO-27 (V4): only once its warning has been shown for two days. The first session start shows
+/// both warnings and archives nothing; the archive is read at a session start two days after it.
 #[test]
 fn day_10_archives_and_does_not_delete() {
     let seed = workspace("r2");
     let gone = add_due(&seed, "Rotate the token", &days_ago(11));
     let staying = add_due(&seed, "Pay the invoice", &days_ago(9));
+
+    let (code, warned, stderr) = run_session_start(&seed, Some("r06-r2"));
+    assert_eq!(code, 0, "session start failed: {stderr}");
+    assert!(warned.contains(&gone.name), "the first start shows the 11-day reminder, warned:\n{warned}");
+    backdate_warned(&seed, &gone.slug, 2);
+    backdate_warned(&seed, &staying.slug, 2);
 
     let (code, stdout, stderr) = run_session_start(&seed, Some("r06-r2"));
     assert_nonempty("session start", &stdout, &stderr);
@@ -436,9 +485,10 @@ fn the_global_graph_is_where_these_fixtures_write_it() {
 }
 
 // ── R8 (rank 06 follow-up, flag 6) ──────────────────────────────────────────
-/// The instruction block tells Claude what to run for a handled reminder, and it must be the command DUE NOW's
-/// own line prints: `base reminder archive <slug>`. Before this follow-up, line 3 still said `remove`, the hard
-/// delete R4 keeps separate, while DUE NOW said `archive` two blocks below it.
+/// The instruction block tells Claude what to run for a handled reminder: `base reminder archive <number>`, the
+/// number DUE NOW prints on the reminder's line. Before rank 06's follow-up, line 3 still said `remove`, the hard
+/// delete R4 keeps separate, while DUE NOW said `archive` two blocks below it. Since BO-00 B4 DUE NOW's lines
+/// carry the number and no command, so line 3 is the only place the command is named.
 ///
 /// Read off the hook's stdout, the channel Claude receives. Controls: the instruction block and DUE NOW both
 /// rendered, so an absent line cannot pass for a correct one. Mutation: put `remove` back in
@@ -451,15 +501,20 @@ fn the_instruction_block_names_archive_for_a_handled_reminder_as_due_now_does() 
     assert_nonempty("session start", &stdout, &stderr);
     assert_eq!(code, 0, "hooks fail open. stderr: {stderr}");
     assert!(
-        stdout.contains("DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:"),
+        stdout.contains("DO THIS FIRST IN YOUR FIRST REPLY:"),
         "control: the instruction block did not render:{NL_MARK}{stdout}",
     );
     assert!(
-        stdout.contains(&format!("clear: base reminder archive {}", due.slug)),
-        "control: DUE NOW did not print its clear command:{NL_MARK}{stdout}",
+        stdout.lines().any(|l| l == format!("  1 {}", due.name)),
+        "control: DUE NOW did not print the reminder as number 1:{NL_MARK}{stdout}",
     );
     assert!(
-        stdout.contains("a handled reminder → `base reminder archive <slug>`."),
+        !stdout.contains(&due.slug),
+        "DUE NOW still spends the first screen on the reminder's slug:{NL_MARK}{stdout}",
+    );
+    assert!(
+        // BO-06 (D16b) reworded line 3 shorter; the command it names is unchanged.
+        stdout.contains("A handled reminder: `base reminder archive <number>`."),
         "the instruction block does not name archive for a handled reminder:{NL_MARK}{stdout}",
     );
     assert!(
@@ -468,5 +523,274 @@ fn the_instruction_block_names_archive_for_a_handled_reminder_as_due_now_does() 
     );
 }
 
+// ── R9 (BO-00 B4) ─────────────────────────────────────────────────────────────
+/// `base reminder archive <number>` and `snooze <number>` act on the reminder the last session start printed under
+/// that number, and say which. A number session start did not print is read as a slug, so it finds nothing and
+/// says so rather than acting on a guess.
+///
+/// Controls: each number is checked against the reminder it must reach AND the one it must not, so a resolver that
+/// ignored the number and took the first reminder fails on 2.
+#[test]
+fn a_due_now_number_archives_and_snoozes_the_reminder_printed_under_it() {
+    let seed = workspace("r9");
+    let first = add_due(&seed, "Pay the invoice", &days_ago(3));
+    let second = add_due(&seed, "Call the bank", &days_ago(2));
+    let (code, stdout, stderr) = run_session_start(&seed, None);
+    assert_eq!(code, 0, "session start failed: {stderr}");
+    assert!(
+        stdout.lines().any(|l| l == format!("  1 {}", first.name))
+            && stdout.lines().any(|l| l == format!("  2 {}", second.name)),
+        "control: DUE NOW did not number the two reminders oldest first:{NL_MARK}{stdout}",
+    );
+
+    let (acode, aout, aerr) = run_base(&seed, &["reminder", "archive", "2"]);
+    assert_nonempty("reminder archive 2", &aout, &aerr);
+    assert_eq!(acode, 0, "archive by number failed: {aout}{aerr}");
+    assert!(
+        aout.contains(&format!("DUE NOW 2 is '{}'", second.slug)),
+        "archive by number did not say which reminder it reached: {aout}"
+    );
+    let (_, live, _) = run_base(&seed, &["reminder", "list"]);
+    assert!(!live.contains(&second.name), "number 2 was not archived:\n{live}");
+    assert!(live.contains(&first.name), "number 2 reached number 1 as well:\n{live}");
+
+    let (scode, sout, serr) = run_base(&seed, &["reminder", "snooze", "1", "2d"]);
+    assert_nonempty("reminder snooze 1", &sout, &serr);
+    assert_eq!(scode, 0, "snooze by number failed: {sout}{serr}");
+    assert!(
+        sout.contains(&format!("DUE NOW 1 is '{}'", first.slug)),
+        "snooze by number did not say which reminder it reached: {sout}"
+    );
+    let (_, live, _) = run_base(&seed, &["reminder", "list"]);
+    let moved = line_with(&live, &first.name).unwrap_or_else(|| panic!("number 1 vanished:\n{live}"));
+    assert!(moved.contains(&days_ahead(2)), "number 1 was not snoozed: {moved}");
+
+    let (ncode, nout, nerr) = run_base(&seed, &["reminder", "archive", "7"]);
+    assert_ne!(ncode, 0, "a number session start never printed must not succeed: {nout}{nerr}");
+    assert!(
+        format!("{nout}{nerr}").contains("no reminder '7'"),
+        "an unprinted number is not reported as not found: {nout}{nerr}"
+    );
+}
+
+// ── R10 (BO-00 code review) ───────────────────────────────────────────────────
+/// Inside a session a DUE NOW number reaches only the reminder THAT session's start printed under it. Another
+/// session's later start rewrites the workspace's letters file and must not move this session's numbers, and a
+/// session with no numbers on file resolves none, whatever the workspace file says.
+///
+/// The failure this closes: A sees 1 = pay, pay is archived, B starts and the workspace file says 1 = call, and
+/// A's `base reminder archive 1` archived call.
+#[test]
+fn a_due_now_number_belongs_to_the_session_that_printed_it() {
+    let seed = workspace("r10");
+    let pay = add_due(&seed, "Pay the invoice", &days_ago(3));
+    let call = add_due(&seed, "Call the bank", &days_ago(2));
+    let (code, stdout, stderr) = run_session_start(&seed, Some("r10-session-a"));
+    assert_eq!(code, 0, "session A's start failed: {stderr}");
+    assert!(stdout.lines().any(|l| l == format!("  1 {}", pay.name)), "control: A sees pay as 1:{NL_MARK}{stdout}");
+
+    let (code, out, err) = run_base(&seed, &["reminder", "archive", &pay.slug]);
+    assert_eq!(code, 0, "archive by slug failed: {out}{err}");
+    let (code, stdout, stderr) = run_session_start(&seed, Some("r10-session-b"));
+    assert_eq!(code, 0, "session B's start failed: {stderr}");
+    assert!(
+        stdout.lines().any(|l| l == format!("  1 {}", call.name)),
+        "control: B's start renumbered, so the workspace file now says 1 = call:{NL_MARK}{stdout}"
+    );
+
+    let (code, out, err) = run_base_in_session(&seed, &["reminder", "archive", "1"], "r10-session-a");
+    assert_eq!(code, 0, "A's archive 1 failed: {out}{err}");
+    assert!(out.contains(&format!("DUE NOW 1 is '{}'", pay.slug)), "A's 1 is not the reminder A saw: {out}");
+    let (_, live, _) = run_base(&seed, &["reminder", "list"]);
+    assert!(live.contains(&call.name), "A's number reached the reminder B numbered 1:\n{live}");
+
+    let (code, out, err) = run_base_in_session(&seed, &["reminder", "archive", "1"], "r10-never-started");
+    assert_ne!(code, 0, "a session with no numbers on file resolved one: {out}{err}");
+    assert!(format!("{out}{err}").contains("no reminder '1'"), "not reported as not found: {out}{err}");
+    let (_, live, _) = run_base(&seed, &["reminder", "list"]);
+    assert!(live.contains(&call.name), "a session with no numbers archived from the workspace file:\n{live}");
+}
+
 /// A line break for the failure messages above, spelled once.
 const NL_MARK: &str = "\n";
+
+// ── BO-27, V4 ────────────────────────────────────────────────────────────────
+/// V4: a reminder 15 days overdue whose warning no session start has shown (a 0.15.2 user, or one who opened no session
+/// from day 8 to day 10) is NOT archived at the next start: it stays in DUE NOW with the warning, dated two days out,
+/// and the start records `warnedAt`. Still live at a second start that day and at one a day later; archived only at a
+/// start two days after the warning was first shown. Control: a 3-day reminder carries no warning and no record.
+#[test]
+fn overdue_reminder_not_archived_before_its_warning_is_seen() {
+    let seed = workspace("bo27-v4a");
+    let late = add_due(&seed, "Pay the insurance premium", &days_ago(15));
+    let fresh = add_due(&seed, "Water the plants", &days_ago(3));
+    assert!(quads(&seed, &late.slug, "warnedAt").is_empty(), "control: no warning recorded before any start");
+
+    let (code, first, stderr) = run_session_start(&seed, Some("bo27-v4a"));
+    assert_eq!(code, 0, "session start failed: {stderr}");
+    let line = line_with(&first, &late.name).unwrap_or_else(|| panic!("the 15-day reminder left DUE NOW:\n{first}"));
+    assert!(
+        line.contains(&format!("archives {} unless snoozed", days_ahead(2))),
+        "warned, with the two days still ahead of it: {line}"
+    );
+    assert_eq!(quads(&seed, &late.slug, "warnedAt").len(), 1, "the shown warning is recorded");
+    assert!(quads(&seed, &fresh.slug, "warnedAt").is_empty(), "control: a 3-day reminder is not warned");
+    assert!(archive_lines(&first).is_empty(), "{first}");
+
+    let (_, second, _) = run_session_start(&seed, Some("bo27-v4a"));
+    assert!(line_with(&second, &late.name).is_some(), "a second start the same day archives nothing:\n{second}");
+    let recorded = quads(&seed, &late.slug, "warnedAt");
+    assert_eq!(recorded.len(), 1, "the first showing is kept, never moved or doubled: {recorded:?}");
+
+    backdate_warned(&seed, &late.slug, 1);
+    let (_, day_one, _) = run_session_start(&seed, Some("bo27-v4a"));
+    assert!(line_with(&day_one, &late.name).is_some(), "one day after the warning it is still live:\n{day_one}");
+
+    backdate_warned(&seed, &late.slug, 2);
+    let (_, day_two, _) = run_session_start(&seed, Some("bo27-v4a"));
+    let (_, live, _) = run_base(&seed, &["reminder", "list"]);
+    assert!(!live.contains(&late.name), "two days after the warning it archives:\n{day_two}\n{live}");
+    assert!(live.contains(&fresh.name), "control: the 3-day reminder stays:\n{live}");
+}
+
+/// V4: every automatic archive prints one line at the start that archives it, naming the reminder and its undo, in the
+/// shape of an upgrade's lines; the next start prints none. The printed undo restores it.
+#[test]
+fn auto_archive_announces_once_with_undo() {
+    let seed = workspace("bo27-v4b");
+    let r = add_due(&seed, "Renew the domain", &days_ago(12));
+    let (code, _, stderr) = run_session_start(&seed, Some("bo27-v4b"));
+    assert_eq!(code, 0, "session start failed: {stderr}");
+    backdate_warned(&seed, &r.slug, 2);
+
+    let (_, archiving, _) = run_session_start(&seed, Some("bo27-v4b"));
+    let undo = format!("base reminder unarchive {}", r.slug);
+    let expected = format!(
+        "base: We archived your reminder '{}': it was 12 days overdue, and its warning first showed on {}. It is kept, not \
+         deleted. To bring it back, run `{undo}`.",
+        r.name,
+        days_ago(2)
+    );
+    assert_eq!(archive_lines(&archiving), vec![expected.as_str()], "{archiving}");
+    let reason = quads(&seed, &r.slug, "archivedReason");
+    let why = format!("auto: 12d past due, warned {}", days_ago(2));
+    assert!(reason.len() == 1 && reason[0].contains(&why), "the stored reason says when and why: {reason:?}");
+    let (_, next, _) = run_session_start(&seed, Some("bo27-v4b"));
+    assert!(archive_lines(&next).is_empty(), "said once:\n{next}");
+    assert!(line_with(&next, &r.name).is_none(), "control: it is archived:\n{next}");
+
+    let words: Vec<&str> = undo.split(' ').skip(1).collect();
+    let (code, out, err) = run_base(&seed, &words);
+    assert_eq!(code, 0, "the printed undo failed: {out}{err}");
+    let (_, live, _) = run_base(&seed, &["reminder", "list"]);
+    assert!(live.contains(&r.name), "the undo restored it:\n{live}");
+}
+
+// ── BO-27, V5 ────────────────────────────────────────────────────────────────
+/// V5: `base reminder unarchive` brings an archived reminder back. One whose time has passed surfaces from now; one
+/// archived before its time keeps it; its archive and its warning record are cleared. A slug no tier holds fails and
+/// says so; a live one is left as it is.
+#[test]
+fn reminder_unarchive_restores() {
+    let seed = workspace("bo27-v5a");
+    let past = add_due(&seed, "Call the bank about the loan", &days_ago(9));
+    let ahead = add_due(&seed, "Send the quarterly pack", &days_ahead(5));
+    let (code, _, stderr) = run_session_start(&seed, Some("bo27-v5a"));
+    assert_eq!(code, 0, "session start failed: {stderr}");
+    assert_eq!(quads(&seed, &past.slug, "warnedAt").len(), 1, "control: the 9-day warning was recorded");
+    for r in [&past, &ahead] {
+        let (code, out, err) = run_base(&seed, &["reminder", "archive", &r.slug]);
+        assert_eq!(code, 0, "archive: {out}{err}");
+    }
+    let (_, gone, _) = run_base(&seed, &["reminder", "list"]);
+    assert!(!gone.contains(&past.name) && !gone.contains(&ahead.name), "control: both archived:\n{gone}");
+
+    for r in [&past, &ahead] {
+        let (code, out, err) = run_base(&seed, &["reminder", "unarchive", &r.slug]);
+        assert_eq!(code, 0, "unarchive: {out}{err}");
+        assert!(out.contains(&format!("Reminder '{}' unarchived (workspace tier)", r.slug)), "{out}");
+    }
+    let (_, live, _) = run_base(&seed, &["reminder", "list"]);
+    let past_line = line_with(&live, &past.name).unwrap_or_else(|| panic!("not restored:\n{live}"));
+    assert!(past_line.contains("| today |"), "a passed time surfaces from now: {past_line}");
+    let ahead_line = line_with(&live, &ahead.name).unwrap_or_else(|| panic!("not restored:\n{live}"));
+    assert!(ahead_line.contains("in 5d"), "a time still ahead is kept: {ahead_line}");
+    assert!(quads(&seed, &past.slug, "warnedAt").is_empty(), "the warning record is cleared");
+    for pred in ["status", "archivedAt", "archivedReason"] {
+        assert!(quads(&seed, &past.slug, pred).is_empty(), "{pred} cleared");
+    }
+
+    let (code, out, err) = run_base(&seed, &["reminder", "unarchive", "no-such-reminder"]);
+    assert_ne!(code, 0, "an unknown slug must fail: {out}");
+    assert!(err.contains("nothing was unarchived"), "{err}");
+    let (code, out, _) = run_base(&seed, &["reminder", "unarchive", &past.slug]);
+    assert_eq!(code, 0);
+    assert!(out.contains("is not archived"), "{out}");
+}
+
+/// V5: `base reminder add` with the name of an archived reminder revives it at the new time and says `revived`, and it
+/// surfaces at the next session start. Before BO-27 it printed `set` and the record stayed archived. One clock: the
+/// record holds one surface time.
+#[test]
+fn readding_an_archived_reminder_revives_it() {
+    let seed = workspace("bo27-v5b");
+    let r = add_due(&seed, "Book the venue", &days_ago(4));
+    let (code, out, err) = run_base(&seed, &["reminder", "archive", &r.slug]);
+    assert_eq!(code, 0, "archive: {out}{err}");
+
+    let (code, out, err) = run_base(&seed, &["reminder", "add", "--name", &r.name, "--due", &days_ago(0)]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains(&format!("Reminder '{}' revived", r.name)), "{out}");
+    assert!(!out.contains("' set "), "never a plain set: {out}");
+    assert_eq!(quads(&seed, &r.slug, "resurfaceAt").len(), 1, "one surface time");
+    assert!(quads(&seed, &r.slug, "status").is_empty(), "the archive is cleared");
+
+    let (_, archived, _) = run_base(&seed, &["reminder", "list", "--archived"]);
+    assert!(!archived.contains(&r.name), "{archived}");
+    let (code, start, stderr) = run_session_start(&seed, Some("bo27-v5b"));
+    assert_eq!(code, 0, "session start failed: {stderr}");
+    assert!(line_with(&start, &r.name).is_some(), "it surfaces in DUE NOW:\n{start}");
+}
+
+/// G0 Q3: re-adding a LIVE reminder's name moves its one clock and says `moved`. Before BO-27 the record gained a second
+/// surface time beside the first.
+#[test]
+fn readding_a_live_reminder_moves_its_clock() {
+    let seed = workspace("bo27-v5c");
+    let r = add_due(&seed, "Chase the signed contract", &days_ago(3));
+    let (code, out, err) = run_base(&seed, &["reminder", "add", "--name", &r.name, "--due", &days_ahead(2)]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains(&format!("Reminder '{}' moved", r.name)), "{out}");
+    assert_eq!(quads(&seed, &r.slug, "resurfaceAt").len(), 1, "one surface time, not two");
+    assert_eq!(quads(&seed, &r.slug, "createdAt").len(), 1, "one record, not a second one beside it");
+    let (_, live, _) = run_base(&seed, &["reminder", "list"]);
+    let line = line_with(&live, &r.name).unwrap_or_else(|| panic!("{live}"));
+    assert!(line.contains(&days_ahead(2)) && !line.contains("overdue"), "{line}");
+}
+
+/// BO-27 code review: `unarchive` brings back only the copies that are archived. A live copy of the same slug in the
+/// other tier keeps its own time, so its overdue age and its warning clock are not reset by someone else's undo.
+#[test]
+fn unarchive_leaves_a_live_copy_in_the_other_tier_alone() {
+    let seed = workspace("bo27-v5d");
+    let r = add_due(&seed, "Renew the lease", &days_ago(9));
+    let (code, out, err) = run_base(&seed, &["reminder", "archive", &r.slug]);
+    assert_eq!(code, 0, "archive: {out}{err}");
+    let live_at = midnight(&days_ago(9));
+    add_global_reminder(&seed, &r.slug, &r.name, &live_at);
+    let global = seed.home.join(".base-gbl").join(".base").join("graph.nq");
+    let global_line = || {
+        std::fs::read_to_string(&global)
+            .expect("global graph")
+            .lines()
+            .find(|l| l.contains(&format!("reminder/{}> <{}resurfaceAt>", r.slug, seed::NS)))
+            .map(str::to_string)
+    };
+    let before = global_line().expect("control: the live global copy");
+
+    let (code, out, err) = run_base(&seed, &["reminder", "unarchive", &r.slug]);
+    assert_eq!(code, 0, "unarchive: {out}{err}");
+    assert!(out.contains("(workspace tier)") && !out.contains("global"), "only the archived copy: {out}");
+    assert_eq!(global_line().as_deref(), Some(before.as_str()), "the live copy kept its own time");
+    assert!(quads(&seed, &r.slug, "status").is_empty(), "the workspace copy is live again");
+}

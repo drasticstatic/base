@@ -273,73 +273,135 @@ pub fn fork_scan(
     Ok((out.trim_end().to_string(), rows.len(), shown, deferred))
 }
 
+/// The DUE NOW block and what session start needs to keep it on the first screen.
+#[derive(Debug, Default)]
+pub struct DueNow {
+    /// Every due reminder, numbered from 1, oldest due first. Empty when nothing is due.
+    pub text: String,
+    /// The slug of each numbered reminder, number 1 first: `base reminder archive <number>` and
+    /// `snooze <number>` read them back from the letters file session start writes.
+    pub slugs: Vec<String>,
+    /// The block listing only the first k reminders, k from `slugs.len() - 1` down to 1, each with
+    /// k. Session start steps down these when DUE NOW would push the first screen past its limit;
+    /// the last one keeps the most overdue reminder, so DUE NOW never shows none.
+    pub fits: Vec<(String, usize)>,
+    /// One per slug: its line carries the archive warning and no session start has shown that warning before. Session
+    /// start records `warnedAt` on the ones it printed (BO-27, V4), and the archive counts from then.
+    pub first_warned: Vec<bool>,
+}
+
 /// The DUE NOW block (spec B1 row 3): reminders whose `resurfaceAt` time has passed, across both
-/// tiers, oldest due first, each with the command that clears it. Returns the block and how many
-/// reminders it lists.
-pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)> {
+/// tiers, oldest due first, each numbered.
+///
+/// UNTIL 2026-10-01 EACH LINE ENDED `· clear: base reminder archive <slug>`, and slugs are built
+/// from the reminder's name, so the clause ran to about 105 UTF-16 units a line. Chris's store had
+/// five due that day: DUE NOW was 1,219 units of a first screen that measured 2,871 against 2,000
+/// (BO-00 B4). The number now stands in for the slug: instruction line 3 says what to run, and
+/// `reminder archive|snooze <number>` resolve it through the letters file.
+pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<DueNow> {
     let Some(store) = crate::store::load_merged(cwd) else {
-        return Ok((String::new(), 0));
+        return Ok(DueNow::default());
     };
-    let now_str = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let now = chrono::Local::now();
     let p = &ns.prefix;
+    // Every reminder, and `crud::reminder::is_due` decides which are due: the same rule the header and the pulse
+    // count by (BO-06, F10c). Archived is read in the reminder's own graph, as the old `FILTER NOT EXISTS` read it.
     let sparql = format!(
-        "{pfx}\nSELECT ?r ?name ?when WHERE {{\n\
+        "{pfx}\nSELECT ?r ?name ?when ?archived ?warned WHERE {{\n\
            GRAPH ?g {{\n\
              ?r a {p}:Reminder ;\n\
                {p}:name ?name ;\n\
                {p}:resurfaceAt ?when .\n\
-             FILTER(?when <= \"{now_str}\"^^xsd:dateTime)\n\
-             FILTER NOT EXISTS {{ ?r {p}:status \"archived\" }}\n\
+             BIND(EXISTS {{ ?r {p}:status \"{archived}\" }} AS ?archived)\n\
+             OPTIONAL {{ ?r {p}:warnedAt ?warned }}\n\
            }}\n\
          }}\n\
          ORDER BY ?when",
-        pfx = crud::prefixes(ns)
+        pfx = crud::prefixes(ns),
+        archived = crud::reminder::ARCHIVED,
     );
 
     let QueryResults::Solutions(solutions) = crate::store::query(&store, &sparql)? else {
-        return Ok((String::new(), 0));
+        return Ok(DueNow::default());
     };
 
-    let rows: Vec<(String, String, String)> = solutions
+    let rows: Vec<(String, String, String, Option<String>)> = solutions
         .filter_map(|r| r.ok())
-        .map(|row| {
+        .filter_map(|row| {
             let get = |k: &str| {
                 row.get(k)
                     .map(|t| crud::term_display(t.into()))
                     .unwrap_or_default()
             };
+            let when = get("when");
+            if !crud::reminder::is_due(&when, get("archived") == "true", now) {
+                return None;
+            }
             let r = get("r");
             let slug = r.rsplit('/').next().unwrap_or(&r).to_string();
-            (slug, get("name"), get("when"))
+            let warned = get("warned");
+            Some((slug, get("name"), when, (!warned.is_empty()).then_some(warned)))
         })
         .collect();
 
     if rows.is_empty() {
-        return Ok((String::new(), 0));
+        return Ok(DueNow::default());
     }
 
-    let mut out = format!("DUE NOW ({}) · all: base reminder list\n", rows.len());
-    for (i, (slug, name, when)) in rows.iter().enumerate() {
-        // Flag 6: a handled reminder is kept, not destroyed, so the clear command archives.
-        // `base reminder remove` is still there and still deletes; it is just not what a
-        // session-start line tells you to reach for.
-        out.push_str(&format!(
-            "  {} {name} · clear: base reminder archive {slug}",
-            i + 1
-        ));
-        // R3/D4: from day 8 the line says when it goes and how to keep it.
-        if crud::reminder::days_past(when)
-            .is_some_and(|d| d >= crud::reminder::WARN_FROM_DAYS)
-            && let Some(on) = crud::reminder::archives_on(when)
-        {
-            out.push_str(&format!(
-                " · archives {on} unless reset: base reminder snooze {slug} <duration>"
-            ));
-        }
-        out.push('\n');
-    }
-    Ok((out.trim_end().to_string(), rows.len()))
+    // Flag 6 still holds: a handled reminder is archived, not removed. Line 3 of the instruction
+    // block names `base reminder archive <number>`; `remove` is never what session start offers.
+    let mut first_warned: Vec<bool> = Vec::with_capacity(rows.len());
+    let lines: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (_, name, when, warned))| {
+            let n = i + 1;
+            let mut line = format!("  {n} {name}");
+            let mut warns = false;
+            // R3/D4: from day 8 the line says when it goes and how to keep it. The date counts from the first time a
+            // session start showed this warning (BO-27, V4), so a reminder warned late still gets its days.
+            if crud::reminder::days_past(when)
+                .is_some_and(|d| d >= crud::reminder::WARN_FROM_DAYS)
+                && let Some(on) = crud::reminder::archives_on(when, warned.as_deref())
+            {
+                line.push_str(&format!(
+                    " · archives {on} unless snoozed: base reminder snooze {n} <duration>"
+                ));
+                warns = true;
+            }
+            first_warned.push(warns && warned.is_none());
+            line
+        })
+        .collect();
+    let total = lines.len();
+    let block = |shown: usize| {
+        let head = if shown == total {
+            format!("DUE NOW ({total}) · all: base reminder list")
+        } else {
+            format!(
+                "DUE NOW ({total}) · {shown} shown · +{} more · all: base reminder list",
+                total - shown
+            )
+        };
+        std::iter::once(head)
+            .chain(lines[..shown].iter().cloned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(DueNow {
+        text: block(total),
+        slugs: rows.into_iter().map(|(slug, _, _, _)| slug).collect(),
+        // Capped, so the renderings stay linear in the reminder count: with no cap, 1,000 due
+        // reminders would build 999 renderings of up to 1,000 lines each (BO-00 code review).
+        fits: (1..total.min(FIT_CAP + 1)).rev().map(|k| (block(k), k)).collect(),
+        first_warned,
+    })
 }
+
+/// The most reminders a trimmed DUE NOW lists. A numbered line is at least about ten UTF-16 units and
+/// the default first screen is 2,000, so more than this never fits one; a DUE NOW longer than the cap
+/// steps from all of them straight to this many.
+const FIT_CAP: usize = 100;
 
 /// Find notes with mentionCount >= threshold — recurring ideas that should be promoted.
 fn mention_threshold_scan(cwd: &Path, ns: &NamespaceConfig, threshold: u32) -> Result<String> {

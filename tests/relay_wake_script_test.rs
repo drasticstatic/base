@@ -27,21 +27,132 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn bash() -> Option<&'static str> {
-    ["bash", "/usr/bin/bash", "/bin/bash"].into_iter().find(|candidate| {
-        Command::new(candidate)
-            .arg("-c")
-            .arg("exit 0")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+/// The bash the wake script runs under, as an absolute path wherever a bare name would lie.
+///
+/// ON WINDOWS A BARE `bash` IS NOT RESOLVED THROUGH `PATH` FIRST. `Command::new("bash")` goes
+/// through `CreateProcess`, which searches the application directory and `System32` BEFORE
+/// `PATH` - and `C:\Windows\System32\bash.exe` is the WSL launcher. Measured 2026-09-21 (flint,
+/// at 566c753): from a Git Bash parent AND from a PowerShell parent, a Rust child spawning
+/// `bash -c` landed in WSL's bash 5.2 with `HOME=/home/<user>`, while `which -a bash` in both
+/// shells listed Git's `usr/bin/bash.exe` first. The launcher re-interprets the `-c` string
+/// once before the inner shell sees it, so `$!` and `$pid` expanded to nothing, the loop was
+/// never killed, and `output()` blocked on a pipe the WSL side never closed. That is the hang
+/// this target carried for a whole round (192s, 292s, then past 25 minutes, killed by hand).
+/// The identical wrapper under Git for Windows' `usr/bin/bash.exe` returned in 16.9s with all
+/// eight pings announced, and under `System32\bash.exe` was still blocked at 45s with none.
+///
+/// So on Windows this walks `PATH` itself, takes the first `bash.exe` that is not under
+/// `SystemRoot` (the WSL launcher) or `WindowsApps` (the Store alias stub), and hands back the
+/// absolute path so `Command` cannot re-resolve it. Elsewhere `bash` on `PATH` is the real
+/// thing. Which bash ran is printed by every leg, so a log always says what it measured.
+///
+/// The search is the product's own, `base::shell::host_bash` (BO-08, F19): the plugin build runs
+/// `prepare.sh` through it, and this file tests the same function rather than a copy of it.
+///
+/// ON CI A MISSING HOST BASH FAILS, IT DOES NOT SKIP. Every leg below prints SKIPPED and returns, which
+/// libtest counts as passed, and the test-count guard (scripts/ci_guards.py) cannot tell that apart from
+/// a pass. A runner without a host bash is a broken runner, so the skip is kept for a dev machine only
+/// (BO-00 code review, 2026-10-01).
+fn bash() -> Option<String> {
+    let found = find_bash();
+    assert!(
+        found.is_some() || std::env::var_os("CI").is_none(),
+        "no host bash on this CI runner: every relay wake test would skip and be counted as passed"
+    );
+    found
+}
+
+/// The product's bash, kept only if it runs.
+fn find_bash() -> Option<String> {
+    let path = base::shell::host_bash().ok()?.to_string_lossy().into_owned();
+    let works = Command::new(&path)
+        .arg("-c")
+        .arg("exit 0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    works.then_some(path)
+}
+
+/// The resolver must never hand back the WSL launcher: that is the hang, not a bash. Two
+/// detectors on two channels - the path string, and what the child itself reports as its
+/// kernel - so a future resolver edit that lands in System32 fails on both, not on a string
+/// this test happens to share with the resolver. On Linux and macOS the resolver returns the bare
+/// `bash`, so after printing which bash it found this test returns early there by design.
+#[test]
+fn resolved_bash_is_not_the_wsl_launcher() {
+    let Some(sh) = bash() else {
+        eprintln!("SKIPPED: bash not on PATH — this test cannot run here, and is not passing.");
+        return;
+    };
+    eprintln!("bash resolved to {sh}");
+    if !cfg!(windows) {
+        return;
+    }
+    assert!(
+        std::path::Path::new(&sh).is_absolute(),
+        "on Windows the path must be absolute, or Command re-resolves it through System32: {sh}"
+    );
+    let lower = sh.to_lowercase();
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()).to_lowercase();
+    assert!(
+        !lower.starts_with(&format!("{}\\", system_root.trim_end_matches('\\'))) && !lower.contains(r"\windows\system32\"),
+        "resolved the WSL launcher: {sh}"
+    );
+    assert!(!lower.contains(r"\windowsapps\"), "resolved a Store alias stub: {sh}");
+    let kernel = Command::new(&sh).arg("-c").arg("uname -s").output().unwrap();
+    let kernel = String::from_utf8_lossy(&kernel.stdout).trim().to_string();
+    assert!(
+        !kernel.starts_with("Linux"),
+        "the child reports kernel {kernel:?}: this bash is running the script inside WSL, not on the host"
+    );
+}
+
+/// Run `script` as a background loop under `sh`, run `while_up` (shell text) beside it, stop the
+/// loop, and return everything the loop printed.
+///
+/// THE LOOP WRITES TO A FILE, NOT TO THE PIPE `output()` READS. `kill $pid` stops the subshell,
+/// but the `sleep 5` it was sitting in is a grandchild and outlives it, and a grandchild that
+/// inherited the pipe's write end keeps `output()` reading until it is gone: measured ~5s extra
+/// per leg under Git Bash, and forever under the WSL launcher (see [`bash`]). With the loop's
+/// stdout on a file, the wrapper's own exit closes the pipe and the orphan's lifetime cannot
+/// reach the test. The file is read back after the wrapper returns, and a file that was never
+/// created is a harness fault named as one, not an empty result graded as a script finding.
+fn run_loop(sh: &str, tmp: &std::path::Path, script: &str, while_up: &str) -> String {
+    let log = tmp.join("loop.out");
+    let log_disp = log.to_string_lossy().replace('\\', "/");
+    let wrapped = format!(
+        "( {script} ) > '{log_disp}' 2>&1 & pid=$!; {while_up}; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0"
+    );
+    let started = std::time::Instant::now();
+    let out = Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
+    eprintln!(
+        "wake loop under {sh}: wrapper returned in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    assert!(
+        out.status.success(),
+        "the wrapper itself failed under {sh} ({:?}) - a harness fault, not a script finding:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::read_to_string(&log).unwrap_or_else(|e| {
+        panic!(
+            "the loop's log {log_disp} was never created under {sh}: {e} - the loop did not \
+             start, so nothing was measured"
+        )
     })
 }
 
-/// Seed `n` pings, run the script for a couple of poll cycles, return stdout.
-fn run_script(sh: &str, inbox: &std::path::Path, script: &str, n: usize) -> String {
+/// Seed `n` pings, run the script for a couple of poll cycles, return what it printed.
+fn run_script(
+    sh: &str,
+    tmp: &std::path::Path,
+    inbox: &std::path::Path,
+    script: &str,
+    n: usize,
+) -> String {
     std::fs::create_dir_all(inbox).unwrap();
     for i in 0..n {
         let mut f = std::fs::File::create(inbox.join(format!("ping-{i:03}.json"))).unwrap();
@@ -51,11 +162,8 @@ fn run_script(sh: &str, inbox: &std::path::Path, script: &str, n: usize) -> Stri
         )
         .unwrap();
     }
-
     // Two poll cycles is enough: the loop sleeps 5s, so 12s covers it with room.
-    let wrapped = format!("( {script} ) & pid=$!; sleep 12; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0");
-    let out = Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    run_loop(sh, tmp, script, "sleep 12")
 }
 
 #[test]
@@ -68,7 +176,7 @@ fn the_shipped_wake_script_announces_every_ping_not_just_the_first_five() {
     let inbox = tmp.path().join("inbox");
     let script = base::relay::wake::watch_script_for(&inbox).unwrap();
 
-    let stdout = run_script(sh, &inbox, &script, 8);
+    let stdout = run_script(&sh, tmp.path(), &inbox, &script, 8);
 
     let announced = stdout.matches("RELAY PING from").count();
     assert_eq!(
@@ -98,10 +206,7 @@ fn a_truncated_ping_says_that_it_was_truncated() {
     write!(f, r#"{{"from": "sender", "summary": "{long}", "doc": null}}"#).unwrap();
 
     let script = base::relay::wake::watch_script_for(&inbox).unwrap();
-    let wrapped =
-        format!("( {script} ) & pid=$!; sleep 8; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0");
-    let out = Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = run_loop(&sh, tmp.path(), &script, "sleep 8");
 
     assert!(
         stdout.to_uppercase().contains("TRUNCATED"),
@@ -170,11 +275,10 @@ fn a_file_that_reads_empty_is_not_consumed() {
     let late_disp = late.to_string_lossy().replace('\\', "/");
 
     // Poll once over both, THEN fill the empty file, then poll again.
-    let wrapped = format!(
-        "( {script} ) & pid=$!; sleep 8;          printf '%s' '{{\"from\": \"sender\", \"summary\": \"the late one\", \"doc\": null}}' > '{late_disp}';          sleep 8; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0"
+    let while_up = format!(
+        "sleep 8; printf '%s' '{{\"from\": \"sender\", \"summary\": \"the late one\", \"doc\": null}}' > '{late_disp}'; sleep 8"
     );
-    let out = Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = run_loop(&sh, tmp.path(), &script, &while_up);
 
     assert!(
         stdout.contains("the good one"),
@@ -208,10 +312,7 @@ fn an_empty_file_announces_nothing_while_it_is_empty() {
     std::fs::File::create(inbox.join("ping-empty.json")).unwrap();
 
     let script = base::relay::wake::watch_script_for(&inbox).unwrap();
-    let wrapped =
-        format!("( {script} ) & pid=$!; sleep 8; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0");
-    let out = Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = run_loop(&sh, tmp.path(), &script, "sleep 8");
 
     assert_eq!(
         stdout.matches("RELAY PING from").count(),
@@ -241,10 +342,7 @@ fn an_empty_file_says_it_could_not_be_read_exactly_once() {
 
     let script = base::relay::wake::watch_script_for(&inbox).unwrap();
     // 13s spans at least two 5s polls, so a line repeating per poll would show up twice.
-    let wrapped =
-        format!("( {script} ) & pid=$!; sleep 13; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0");
-    let out = Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = run_loop(&sh, tmp.path(), &script, "sleep 13");
 
     assert_eq!(
         stdout.matches("RELAY EMPTY READ:").count(),
@@ -288,9 +386,7 @@ fn the_emitted_script_writes_the_fingerprint_and_title_into_the_sentinel() {
     std::fs::create_dir_all(&inbox).unwrap();
 
     let script = base::relay::wake::watch_script_for(&inbox).unwrap();
-    let wrapped =
-        format!("( {script} ) & pid=$!; sleep 3; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0");
-    Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
+    run_loop(&sh, tmp.path(), &script, "sleep 3");
 
     let body = std::fs::read_to_string(inbox.join(".watching"))
         .expect("the loop must create the sentinel");
@@ -329,4 +425,40 @@ fn the_fingerprint_is_stable_across_calls() {
     assert_eq!(a, b, "the same template must hash the same way twice");
     assert_eq!(a.len(), 16, "expected 16 hex characters, got {a:?}");
     assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "not hex: {a:?}");
+}
+
+/// BO-05 (F12b): a watcher prints only the pings addressed to the session that held its title when it was armed. A
+/// ping file naming another session in `to_session` (sent to a previous holder, or to the next one while an old
+/// holder's watcher still runs) is never printed; one naming this session, or naming none, is.
+#[test]
+fn a_watcher_prints_only_the_pings_addressed_to_its_session() {
+    let Some(sh) = bash() else {
+        eprintln!("SKIPPED: bash not on PATH — this test cannot run here, and is not passing.");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    for (name, to, msg) in [
+        ("ping-001.json", Some("sess-mine"), "for this session"),
+        ("ping-002.json", Some("sess-other"), "for another session"),
+        ("ping-003.json", None, "from an old writer with no to_session"),
+    ] {
+        let to = to.map(|t| format!(r#""to_session": "{t}", "#)).unwrap_or_default();
+        let mut f = std::fs::File::create(inbox.join(name)).unwrap();
+        write!(f, r#"{{"slug": "x", "summary": "{msg}", "doc": "", "from": "bison", "to_title": "lynx", {to}"kind": "ping"}}"#)
+            .unwrap();
+    }
+    let script = base::relay::wake::watch_script_for_session(&inbox, "sess-mine").unwrap();
+    assert!(script.contains("SESSION=\"sess-mine\""), "{script}");
+    let stdout = run_loop(&sh, tmp.path(), &script, "sleep 8");
+    assert!(stdout.contains("for this session"), "{stdout}");
+    assert!(stdout.contains("from an old writer with no to_session"), "{stdout}");
+    assert!(!stdout.contains("for another session"), "another session's ping was printed:\n{stdout}");
+    assert_eq!(stdout.matches("RELAY PING from").count(), 2, "{stdout}");
+
+    // With no session (nobody held the title when it was armed) nothing is skipped.
+    let all = base::relay::wake::watch_script_for(&inbox).unwrap();
+    let stdout = run_loop(&sh, tmp.path(), &all, "sleep 8");
+    assert_eq!(stdout.matches("RELAY PING from").count(), 3, "{stdout}");
 }

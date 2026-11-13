@@ -20,8 +20,13 @@ use super::{Reason, Rendered};
 
 /// The record file, in a tier's `.base`.
 pub const FILE: &str = "hook-output.jsonl";
+/// The prompt hook's last untrimmed output, in the same `.base` as [`FILE`]. Session start has had
+/// `last-session-start.md` since rank 00; the prompt hook had nothing, so what its cap withheld was gone.
+pub const PROMPT_FULL_FILE: &str = "last-prompt-submit.md";
 /// Where a full [`FILE`] goes when the next record arrives.
 pub const PREVIOUS: &str = "hook-output.1.jsonl";
+/// Each hook's last [`WINDOW`] rows, carried out of [`PREVIOUS`] before a rotation replaces it (see `carry_windows`).
+pub const CARRIED: &str = "hook-output.carried.jsonl";
 /// The size at which [`FILE`] is renamed to [`PREVIOUS`].
 pub const CAP_BYTES: u64 = 1 << 20;
 /// How many runs per hook doctor reads (spec A7's "the last N runs").
@@ -35,7 +40,7 @@ pub fn record_of(r: &Rendered, hook: &str, session_id: Option<&str>) -> serde_js
         .iter()
         .map(|w| serde_json::json!({ "block": w.block, "items": w.items, "reason": w.reason.as_str() }))
         .collect();
-    serde_json::json!({
+    let mut row = serde_json::json!({
         "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
         "hook": hook,
         "session_id": session_id,
@@ -44,10 +49,62 @@ pub fn record_of(r: &Rendered, hook: &str, session_id: Option<&str>) -> serde_js
         "emitted_bytes": r.emitted_bytes,
         "budget_bytes": r.budget_bytes,
         "full_bytes": r.full_bytes,
-        // Still UTF-16: the first screen is a readability limit, not a delivery one.
+        // Still UTF-16: the first screen is a readability limit, not a delivery one. `first_screen_u16`
+        // is the LIMIT (it read 2000 in every row); `first_screen_len_u16` is the measured length.
         "first_screen_u16": r.first_screen_u16,
+        "first_screen_len_u16": r.first_screen_len_u16,
         "over_budget": r.over_budget,
         "first_screen_ok": r.first_screen_ok,
+        "withheld": withheld,
+    });
+    // Only on the run that has one (BO-28): a length past the limit beside `first_screen_ok: true` names its reason.
+    if let Some(block) = &r.first_screen_excused {
+        row["first_screen_excused"] = serde_json::Value::from(block.as_str());
+    }
+    row
+}
+
+/// The record of one prompt-hook emission, from what [`super::prompt::fit`] decided.
+///
+/// F7 (BO-01). Until 2026-10-01 this row said how many bytes the cut withheld and `"withheld": []`, so what a prompt
+/// lost could not be named: 8,719 bytes of one real prompt are unknown for that reason. Every dropped block is now a
+/// row in the shape session start writes (`block`, `items`, `reason`) plus its `bytes`, and `withheld_bytes` is their
+/// sum. `over_budget` keeps its meaning for this hook, something was withheld, so doctor's counts read as before, and
+/// is also true for output still over the budget after every drop. No first-screen fields: this hook has no first
+/// screen, and a value would read as a measurement.
+pub fn record_of_prompt(f: &super::prompt::Fitted, hook: &str, session_id: Option<&str>) -> serde_json::Value {
+    let mut withheld: Vec<serde_json::Value> = f
+        .dropped_blocks()
+        .map(|b| {
+            serde_json::json!({
+                "block": b.id,
+                "items": b.items,
+                "bytes": b.bytes(),
+                "reason": Reason::Budget.as_str(),
+            })
+        })
+        .collect();
+    // A ranked block printed in part (BO-18): a row for what it withheld, `items` of `of`.
+    withheld.extend(f.partial_blocks().map(|(b, n, bytes)| {
+        serde_json::json!({
+            "block": b.id,
+            "items": n,
+            "of": b.items,
+            "bytes": bytes,
+            "reason": Reason::Budget.as_str(),
+        })
+    }));
+    serde_json::json!({
+        "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+        "hook": hook,
+        "session_id": session_id,
+        "emitted_bytes": f.emitted_bytes(),
+        "budget_bytes": f.budget_bytes,
+        "full_bytes": f.full_bytes(),
+        // Something was withheld, or (only with a budget smaller than the header and the blocks too short to drop)
+        // the output is still over it: either way the host may not deliver all of it.
+        "over_budget": f.lost() || f.still_over_budget(),
+        "withheld_bytes": f.withheld_bytes(),
         "withheld": withheld,
     })
 }
@@ -61,9 +118,16 @@ pub fn keep(dir: &Path, record: &serde_json::Value) -> Result<(), String> {
 fn keep_capped(dir: &Path, record: &serde_json::Value, cap: u64) -> Result<(), String> {
     let path = dir.join(FILE);
     if std::fs::metadata(&path).is_ok_and(|m| m.len() >= cap) {
+        // The carry is read BEFORE the rename replaces PREVIOUS and written only AFTER the rename succeeded: a rename
+        // refused under an open handle leaves PREVIOUS in place, and carrying its rows anyway would count them twice.
+        let carried = carry_windows(dir);
         // A rename refused under an open handle loses nothing: the append below still happens, the file grows past
         // its cap, and a later record renames it.
-        let _ = crate::store::rename_with_retry(&path, &dir.join(PREVIOUS));
+        if crate::store::rename_with_retry(&path, &dir.join(PREVIOUS)).is_ok()
+            && let Some(body) = carried
+        {
+            let _ = super::write_full_output(&dir.join(CARRIED), &body);
+        }
     }
     let mut line = record.to_string();
     line.push('\n');
@@ -75,8 +139,54 @@ fn keep_capped(dir: &Path, record: &serde_json::Value, cap: u64) -> Result<(), S
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Before a rotation replaces [`PREVIOUS`], keep each hook's last [`WINDOW`] rows from it, and from what was carried
+/// before, in [`CARRIED`].
+///
+/// Doctor reads a window of runs PER HOOK, and one hook's rows must never rotate another's out of it. The prompt hook
+/// writes a row on every prompt and session start one per session, so two files of rows can hold no session start at
+/// all (named in BO-00's code review, from `8c8fe9b`; carried into BO-01). Returns the new [`CARRIED`] body, which the
+/// caller writes through a temp file and a rename, only at a rotation, so the append path stays one write. It holds at
+/// most [`WINDOW`] rows per hook. `None` when there is nothing to carry.
+fn carry_windows(dir: &Path) -> Option<String> {
+    let mut rows: Vec<String> = Vec::new();
+    for name in [CARRIED, PREVIOUS] {
+        if let Ok(bytes) = std::fs::read(dir.join(name)) {
+            rows.extend(
+                String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(String::from),
+            );
+        }
+    }
+    let hook_of = |line: &str| -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        v.get("hook")?.as_str().map(String::from)
+    };
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut carry = vec![false; rows.len()];
+    for (i, line) in rows.iter().enumerate().rev() {
+        let Some(hook) = hook_of(line) else { continue };
+        let n = seen.entry(hook).or_insert(0);
+        if *n < WINDOW {
+            *n += 1;
+            carry[i] = true;
+        }
+    }
+    let body: String = rows
+        .iter()
+        .zip(&carry)
+        .filter(|(_, c)| **c)
+        .map(|(l, _)| format!("{l}\n"))
+        .collect();
+    (!body.is_empty()).then_some(body)
+}
+
 /// A withheld row read back: block, items, reason.
 pub type Row = (String, usize, String);
+
+/// A block the prompt hook's budget dropped, read back: block, items, bytes.
+pub type Dropped = (String, usize, usize);
 
 /// What a recorded size is measured in.
 ///
@@ -149,6 +259,9 @@ pub struct Run {
     pub full: Size,
     /// Always UTF-16: a readability limit, unchanged by the byte conversion.
     pub first_screen_u16: usize,
+    /// The measured first screen, UTF-16. `None` on a row written before 2026-10-01, when only the
+    /// limit was recorded, and on a prompt-hook row, which has no first screen.
+    pub first_screen_len_u16: Option<usize>,
     pub over_budget: bool,
     pub first_screen_ok: bool,
     /// Rows the trimmer degraded, in ledger order.
@@ -157,6 +270,11 @@ pub struct Run {
     pub other_withheld: Vec<Row>,
     /// Rows whose reason this build does not know. Named by doctor, never counted as "not trimmed".
     pub unrecognised: Vec<Row>,
+    /// Blocks the prompt hook's budget dropped whole, with their bytes (BO-01, reason `budget`), in output order.
+    pub dropped: Vec<Dropped>,
+    /// What the prompt hook withheld, in bytes. Before BO-01 it cut whole lines from the END and this was all it said;
+    /// since, it is the sum of [`Run::dropped`]. Zero for session start, which reports its losses as rows instead.
+    pub withheld_bytes: usize,
 }
 
 /// One hook's runs on record in a tier.
@@ -203,12 +321,13 @@ impl TierSizes {
     }
 }
 
-/// Read `dir`'s [`PREVIOUS`], then its [`FILE`], and keep each hook's last `window` runs.
+/// Read `dir`'s [`CARRIED`], [`PREVIOUS`] and [`FILE`], oldest first, and keep each hook's last `window` runs.
 pub fn read(tier: &str, dir: &Path, window: usize) -> TierSizes {
     let mut present = false;
     let (mut unreadable_lines, mut unreadable_files) = (0usize, 0usize);
     let mut runs: Vec<(String, Run)> = Vec::new();
-    for name in [PREVIOUS, FILE] {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in [CARRIED, PREVIOUS, FILE] {
         let bytes = match std::fs::read(dir.join(name)) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -220,7 +339,9 @@ pub fn read(tier: &str, dir: &Path, window: usize) -> TierSizes {
         };
         present = true;
         for line in String::from_utf8_lossy(&bytes).lines() {
-            if line.trim().is_empty() {
+            // A row carried into CARRIED is never also in PREVIOUS or FILE, since the carry is written only after a
+            // successful rotation; skipping an exact repeat keeps two concurrent rotations from counting one twice.
+            if line.trim().is_empty() || !seen.insert(line.to_string()) {
                 continue;
             }
             match parse(line) {
@@ -310,12 +431,16 @@ fn parse(line: &str) -> Option<(String, Run)> {
         emitted: sized("emitted_bytes", "emitted_u16")?,
         budget: sized("budget_bytes", "budget_u16")?,
         full: sized("full_bytes", "full_u16")?,
-        first_screen_u16: number("first_screen_u16")?,
+        // A prompt-hook record has no first screen and writes no first-screen fields (see `record_of_prompt`).
+        first_screen_u16: number("first_screen_u16").unwrap_or(0),
+        first_screen_len_u16: number("first_screen_len_u16"),
         over_budget: flag("over_budget")?,
-        first_screen_ok: flag("first_screen_ok")?,
+        first_screen_ok: flag("first_screen_ok").unwrap_or(true),
         trimmed: Vec::new(),
         other_withheld: Vec::new(),
         unrecognised: Vec::new(),
+        dropped: Vec::new(),
+        withheld_bytes: number("withheld_bytes").unwrap_or(0),
     };
     for w in v.get("withheld")?.as_array()? {
         let reason = w.get("reason")?.as_str()?;
@@ -325,6 +450,10 @@ fn parse(line: &str) -> Option<(String, Run)> {
             reason.to_string(),
         );
         match Reason::parse(reason) {
+            Some(Reason::Budget) => {
+                let bytes = usize::try_from(w.get("bytes")?.as_u64()?).ok()?;
+                run.dropped.push((row.0, row.1, bytes));
+            }
             Some(r) if r.is_trim() => run.trimmed.push(row),
             Some(_) => run.other_withheld.push(row),
             None => run.unrecognised.push(row),
@@ -336,6 +465,115 @@ fn parse(line: &str) -> Option<(String, Run)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prompt hook's record reads back as a run doctor can print: every dropped block by name, items and bytes,
+    /// their sum, and no invented first screen (F7).
+    #[test]
+    fn a_prompt_record_reads_back_with_what_it_withheld() {
+        use super::super::prompt::{fit, Priority, PromptBlock, PromptBlocks};
+        let mut blocks = PromptBlocks::new();
+        blocks.push(PromptBlock::new("relay-wake", Priority::Relay, &"w".repeat(3_400), 1, "wake contract"));
+        blocks.push(PromptBlock::new("global-context", Priority::Global, &"g".repeat(1_150), 5, "record"));
+        let f = fit("<context-bracket>[FRESH] (prompt 3)</context-bracket>", blocks, 4000, "prompt_bytes");
+        let line = record_of_prompt(&f, "user-prompt-submit", Some("sid")).to_string();
+        let (hook, run) = parse(&line).expect("the prompt record must parse");
+        assert_eq!(hook, "user-prompt-submit");
+        assert_eq!(run.emitted, Size::bytes(f.text.len()));
+        assert_eq!(run.budget, Size::bytes(4000));
+        assert_eq!(run.full, Size::bytes(f.full_text.len()));
+        assert_eq!(run.dropped, vec![("global-context".to_string(), 5, 1_150)]);
+        assert_eq!(run.withheld_bytes, 1_150, "the sum of the dropped blocks");
+        assert!(run.trimmed.is_empty() && run.unrecognised.is_empty(), "a budget row is neither a trim nor unknown");
+        assert!(run.over_budget, "a run that dropped a block is flagged");
+        assert!(run.first_screen_ok, "no first screen, so never a first-screen overflow");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            v["withheld"],
+            serde_json::json!([{"block": "global-context", "items": 5, "bytes": 1150, "reason": "budget"}]),
+            "session start's row shape plus bytes"
+        );
+        // A run that fitted says nothing was withheld.
+        let mut small = PromptBlocks::new();
+        small.push(PromptBlock::new("hooks-rules", Priority::Matched, "[DOMAIN: hooks]\n  0. a rule", 1, "rule"));
+        let f = fit("", small, 4000, "prompt_bytes");
+        let (_, run) = parse(&record_of_prompt(&f, "user-prompt-submit", None).to_string()).unwrap();
+        assert_eq!((run.withheld_bytes, run.dropped.len()), (0, 0));
+        assert!(!run.over_budget);
+        // A budget smaller than the header, which is always kept: nothing withheld, still over. The row says so, rather
+        // than reading as within budget (code review, 2026-10-01).
+        let f = fit("<context-bracket>[FRESH] (prompt 1)</context-bracket>", PromptBlocks::new(), 30, "prompt_bytes");
+        assert!(!f.lost() && f.still_over_budget(), "control: over with nothing dropped");
+        let (_, run) = parse(&record_of_prompt(&f, "user-prompt-submit", None).to_string()).unwrap();
+        assert!(run.over_budget, "still over budget is recorded as over budget");
+    }
+
+    /// A row carried into CARRIED that is also still in PREVIOUS (a carry written by one rotation while another's
+    /// rename failed) is read once, never counted twice (code review, 2026-10-01).
+    #[test]
+    fn a_row_in_two_files_is_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = line("session-start", 7, &[]);
+        keep(dir.path(), &row).unwrap();
+        std::fs::write(dir.path().join(CARRIED), format!("{row}\n")).unwrap();
+        let t = read("workspace", dir.path(), WINDOW);
+        assert_eq!(t.event("session-start").map(|e| e.runs), Some(1));
+    }
+
+    /// One hook's rows never rotate another's out of doctor's window (BO-00 review, carried into BO-01): 25 session
+    /// starts, then enough prompt rows to rotate the file many times over, and both hooks still read back 20 runs
+    /// ending at their own last one.
+    #[test]
+    fn each_hook_keeps_its_window_across_rotations() {
+        let dir = tempfile::tempdir().unwrap();
+        keep(dir.path(), &line("session-start", 1, &[])).unwrap();
+        let one = std::fs::metadata(dir.path().join(FILE)).unwrap().len();
+        std::fs::remove_file(dir.path().join(FILE)).unwrap();
+        let cap = one * 8;
+        for s in 1..=25 {
+            keep_capped(dir.path(), &line("session-start", s, &[]), cap).unwrap();
+        }
+        for p in 1..=200 {
+            keep_capped(dir.path(), &line("user-prompt-submit", 1000 + p, &[]), cap).unwrap();
+        }
+        let t = read("workspace", dir.path(), WINDOW);
+        let starts = t.event("session-start").expect("session start survives the prompt rows");
+        assert_eq!((starts.runs, starts.last.emitted.value), (WINDOW, 25), "the last 20 session starts");
+        let prompts = t.event("user-prompt-submit").expect("prompt rows");
+        assert_eq!((prompts.runs, prompts.last.emitted.value), (WINDOW, 1200));
+        let carried = std::fs::read_to_string(dir.path().join(CARRIED)).expect("rows were carried");
+        assert!(carried.lines().count() <= 2 * WINDOW, "at most a window per hook is carried");
+        // Control: without the carry, the two live files alone hold no session start.
+        let live: String = [PREVIOUS, FILE]
+            .iter()
+            .map(|n| std::fs::read_to_string(dir.path().join(n)).unwrap_or_default())
+            .collect();
+        assert!(!live.contains("\"session-start\""), "control: the rotation did push session start out");
+    }
+
+    /// The record carries the measured first screen beside its limit, and a row written before the field existed
+    /// reads back as unmeasured, never as a length of zero. The `Rendered` comes from `Emission::render`, so the
+    /// census of construction sites is unchanged.
+    #[test]
+    fn the_first_screen_length_is_recorded_beside_its_limit() {
+        use super::super::{Block, Emission, FullOutput, Rank};
+        let tail = "y".repeat(500);
+        let mut e = Emission::new(9000, 2000);
+        assert!(e.push(Block::new("instructions", Rank::Pinned, "x".repeat(30), "", "")));
+        assert!(e.push(Block::new("reminders", Rank::DueNow, "z".repeat(40), "", "")));
+        assert!(e.push(Block::new("pulse", Rank::Tail, tail.clone(), "", "")));
+        let r = e.render(&FullOutput::off(), None);
+        let first_screen = &r.text[..r.text.find(&tail).expect("the tail block is printed")];
+        assert_eq!(
+            r.first_screen_len_u16,
+            first_screen.encode_utf16().count(),
+            "the length is everything printed before the first block below DueNow"
+        );
+        assert!(r.first_screen_len_u16 >= 70, "control: both first-screen blocks are counted");
+        let (_, run) = parse(&record_of(&r, "session-start", None).to_string()).expect("the record parses");
+        assert_eq!((run.first_screen_u16, run.first_screen_len_u16), (2000, Some(r.first_screen_len_u16)));
+        let (_, old) = parse(&line("session-start", 5, &[]).to_string()).expect("an old row parses");
+        assert_eq!(old.first_screen_len_u16, None, "an old row has no measured length");
+    }
 
     /// A record as a JSON line, the shape `record_of` writes. Built by hand so no test here constructs a `Rendered`:
     /// the census of `Rendered` construction sites stays at the one in `Emission::render`.

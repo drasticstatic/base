@@ -365,9 +365,9 @@ pub fn migrate_tier(
     // first migration still snapshots, below.
     let is_delta = stamped;
 
-    // C1: snapshot first, sharing the `BACKUP_KEEP = 10` pool with compact — but
+    // C1: snapshot first, sharing the `[graph] keep_backups` pool with compact — but
     // only when there is data to protect. A pass that writes nothing but the stamp
-    // must not evict a compact backup from a pool of ten, which is what the
+    // must not evict a compact backup from that pool, which is what the
     // comment, `docs/graph-durability.md` and the outcome's own `backup: None`
     // have always claimed and what the code did not do (kite, PR #50).
     if !plan.is_empty() {
@@ -452,6 +452,17 @@ pub fn migrate_tiers(cwd: &Path, ns: &NamespaceConfig, trigger: Trigger) -> Vec<
         })
         .filter(|o| o.total_linked() > 0 || o.skipped_unhealthy)
         .collect()
+}
+
+/// The upgrade path's store repair (BO-12, F15e). A store upgraded from 0.15 carries what `base doctor` reports on one
+/// that never left 0.16: corrections with no link to the one record their text names (every other correction stays a
+/// correction, D18), another workspace's records, a supersession disagreement,
+/// legacy `[signal] max_chars`, graphs never compacted and ten backups a tier. The repair is [`crate::fix::run`], the
+/// function `base doctor --fix` calls, and nothing else, so the two cannot drift: `base graph migrate` plans it and
+/// `base graph migrate --yes` applies it. An upgrade applies it unasked, once per version and tier, in the background
+/// process the first session start on the new version starts ([`crate::upgrade`], BO-26), through [`crate::fix::run_tier`].
+pub fn upgrade(cwd: &Path, apply: bool) -> crate::fix::Report {
+    crate::fix::run(cwd, apply)
 }
 
 /// Workspace root (the dir holding `.base/`) then `~/.base-gbl`, de-duplicated.
@@ -563,7 +574,12 @@ fn rel_to_root(root: &Path, p: &str) -> Option<String> {
     let norm = |s: &str| s.replace('\\', "/").trim_end_matches('/').to_string();
     let p = norm(&p.replace("\\\\", "\\"));
     let r = norm(&root.to_string_lossy());
-    if !r.is_empty() && p.len() > r.len() && p[..r.len()].eq_ignore_ascii_case(&r) && p.as_bytes()[r.len()] == b'/' {
+    // `get`, as in `under`: the root's length can land inside a multi-byte character of `p`.
+    if !r.is_empty()
+        && p.len() > r.len()
+        && p.get(..r.len()).is_some_and(|head| head.eq_ignore_ascii_case(&r))
+        && p.as_bytes()[r.len()] == b'/'
+    {
         return Some(p[r.len() + 1..].to_string());
     }
     // Already relative: no drive letter, no leading slash, no UNC.
@@ -697,11 +713,13 @@ fn project_domain(facts: &Facts, ns: &NamespaceConfig, literal: &str) -> Option<
 }
 
 /// Is `rel` inside `dir`? Case-insensitive, because a Windows store holds
-/// `Tools/stt` and a trigger may say `tools/stt`.
+/// `Tools/stt` and a trigger may say `tools/stt`. `get` rather than a byte
+/// slice: when `dir.len()` lands inside a multi-byte char of `rel` (a note
+/// named `a → b.md`), the prefix cannot match, and slicing would panic.
 fn under(rel: &str, dir: &str) -> bool {
     !dir.is_empty()
         && rel.len() > dir.len()
-        && rel[..dir.len()].eq_ignore_ascii_case(dir)
+        && rel.get(..dir.len()).is_some_and(|head| head.eq_ignore_ascii_case(dir))
         && rel.as_bytes()[dir.len()] == b'/'
 }
 
@@ -1080,11 +1098,23 @@ mod tests {
     }
 
     #[test]
+    fn rel_to_root_with_a_multibyte_char_at_the_root_length_is_a_miss_not_a_panic() {
+        // The root is 6 bytes; byte 6 of the path is the middle of `é`.
+        let root = Path::new("C:/a/b");
+        assert_eq!(rel_to_root(root, "C:/a/é/x"), None);
+        assert_eq!(rel_to_root(root, "C:/a/b/é").as_deref(), Some("é"), "control: the same root still strips");
+    }
+
+    #[test]
     fn under_is_a_path_test_not_a_string_prefix() {
         assert!(under("Documents/video-gen/a.md", "Documents/video-gen"));
         assert!(under("Tools/stt/x.md", "tools/stt"), "Windows paths are case-insensitive");
         assert!(!under("Documents/video-generator/a.md", "Documents/video-gen"));
         assert!(!under("Documents/video-gen", "Documents/video-gen"), "the dir is not under itself");
         assert!(!under("anything", ""));
+        assert!(
+            !under("notes/a → b.md", "notes/a x"),
+            "a trigger length that splits a multi-byte char is a miss, not a panic"
+        );
     }
 }
