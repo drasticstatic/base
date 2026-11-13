@@ -1,3 +1,9 @@
+> **drasticstatic's public fork of `base`, pinned to a reviewed revision.** This fork sits at upstream
+> [ChristopherKahler/base](https://github.com/ChristopherKahler/base) `v0.16.0` (`a37b9a8f`), read as text on
+> 2026-11-12 before it was merged. It is not installed anywhere. Why we keep it, the pin, the licence and what to know
+> before anyone runs it: [`DRASTICSTATIC.md`](./DRASTICSTATIC.md). Everything below this note is upstream's README,
+> unchanged.
+
 <p align="center">
   <img src="docs/splash.svg" alt="basemode — the memory your agents were supposed to come with" width="100%">
 </p>
